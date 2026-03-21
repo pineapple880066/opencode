@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "verbatimModuleSyntax": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "@agent-ide/core": [
+        "packages/core/src/index.ts"
+      ],
+      "@agent-ide/db": [
+        "packages/db/src/index.ts"
+      ],
+      "@agent-ide/runtime": [
+        "packages/runtime/src/index.ts"
+      ],
+      "@agent-ide/tools": [
+        "packages/tools/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "apps/**/*.ts",
+    "packages/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}
+
