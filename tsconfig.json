@@ -23,6 +23,9 @@
       ],
       "@agent-ide/tools": [
         "packages/tools/src/index.ts"
+      ],
+      "@agent-ide/ide-web": [
+        "apps/ide-web/src/index.ts"
       ]
     }
   },
@@ -35,4 +38,3 @@
     "dist"
   ]
 }
-

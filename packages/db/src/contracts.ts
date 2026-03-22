@@ -4,6 +4,7 @@
 export interface WorkspaceRow {
   id: string;
   path: string;
+  path_hash: string;
   label: string;
   created_at: string;
   updated_at: string;
@@ -119,6 +120,32 @@ export interface CheckpointRow {
   created_at: string;
 }
 
+// LangGraphCheckpoints 不是普通业务 checkpoint，而是 LangGraph 自己的 durable execution 账本。
+// 它们需要保存 thread、namespace、parent lineage 和序列化后的 checkpoint payload。
+export interface LangGraphCheckpointRow {
+  thread_id: string;
+  checkpoint_ns: string;
+  checkpoint_id: string;
+  parent_checkpoint_id?: string;
+  checkpoint_b64: string;
+  metadata_b64: string;
+  created_at: string;
+}
+
+// LangGraphCheckpointWriteRow 用来保存和某个 checkpoint 绑定的 pending writes。
+// 没有这张表，就不能说 LangGraph 的持久化 checkpointer 真正落库了。
+export interface LangGraphCheckpointWriteRow {
+  thread_id: string;
+  checkpoint_ns: string;
+  checkpoint_id: string;
+  task_id: string;
+  write_idx: number;
+  channel_name: string;
+  value_b64: string;
+  created_at: string;
+  updated_at: string;
+}
+
 // ToolInvocationRow 需要持久化，这样后面才能做回放、审计和问题排查。
 export interface ToolInvocationRow {
   id: string;
@@ -145,5 +172,7 @@ export const DATABASE_MUST_HAVE_TABLES = [
   "memory_records",
   "subagent_runs",
   "checkpoints",
+  "langgraph_checkpoints",
+  "langgraph_checkpoint_writes",
   "tool_invocations",
 ] as const;

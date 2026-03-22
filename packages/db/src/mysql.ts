@@ -15,6 +15,7 @@ export function toMySqlPoolOptions(config: MySqlConfig): PoolOptions {
     idleTimeout: 60_000,
     queueLimit: 0,
     decimalNumbers: true,
+    dateStrings: true,
     namedPlaceholders: true,
     timezone: "Z",
     charset: "utf8mb4",
@@ -43,4 +44,3 @@ export async function withTransaction<T>(
     connection.release();
   }
 }
-

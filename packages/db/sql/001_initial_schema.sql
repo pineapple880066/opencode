@@ -7,10 +7,11 @@
 CREATE TABLE IF NOT EXISTS workspaces (
   id VARCHAR(64) NOT NULL PRIMARY KEY,
   path VARCHAR(1024) NOT NULL,
+  path_hash CHAR(64) NOT NULL,
   label VARCHAR(255) NOT NULL,
   created_at DATETIME(3) NOT NULL,
   updated_at DATETIME(3) NOT NULL,
-  UNIQUE KEY uk_workspaces_path (path)
+  UNIQUE KEY uk_workspaces_path_hash (path_hash)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -130,6 +131,34 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   KEY idx_checkpoints_node (node)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS langgraph_checkpoints (
+  thread_id VARCHAR(128) NOT NULL,
+  checkpoint_ns VARCHAR(128) NOT NULL DEFAULT '',
+  checkpoint_id VARCHAR(64) NOT NULL,
+  parent_checkpoint_id VARCHAR(64) NULL,
+  checkpoint_b64 LONGTEXT NOT NULL,
+  metadata_b64 LONGTEXT NOT NULL,
+  created_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id),
+  KEY idx_langgraph_parent_checkpoint (thread_id, checkpoint_ns, parent_checkpoint_id),
+  KEY idx_langgraph_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS langgraph_checkpoint_writes (
+  thread_id VARCHAR(128) NOT NULL,
+  checkpoint_ns VARCHAR(128) NOT NULL DEFAULT '',
+  checkpoint_id VARCHAR(64) NOT NULL,
+  task_id VARCHAR(128) NOT NULL,
+  write_idx INT NOT NULL,
+  channel_name VARCHAR(128) NOT NULL,
+  value_b64 LONGTEXT NOT NULL,
+  created_at DATETIME(3) NOT NULL,
+  updated_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, write_idx),
+  KEY idx_langgraph_writes_checkpoint (thread_id, checkpoint_ns, checkpoint_id),
+  KEY idx_langgraph_writes_task (task_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS tool_invocations (
   id VARCHAR(64) NOT NULL PRIMARY KEY,
   session_id VARCHAR(64) NOT NULL,
@@ -146,4 +175,3 @@ CREATE TABLE IF NOT EXISTS tool_invocations (
   KEY idx_tool_invocations_subagent_run_id (subagent_run_id),
   KEY idx_tool_invocations_tool_name (tool_name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-

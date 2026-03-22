@@ -36,6 +36,9 @@ description: 这个 skill 用于本仓库中的重要工作，在宣布完成前
    - 如果只是脚手架，就说“已搭骨架”
    - 如果只有合同和类型，就说“已定义合同”
    - 只有在有测试或强验证证据时，才能说“已实现并验证”
+6. 如果本次改动涉及架构边界、关键 trade-off、实现进度或面试讲法，必须同步检查并更新：
+   - `docs/interview-notes.md`
+   - `docs/progress.md`
 
 ## 收尾前必须自问的问题
 
@@ -46,6 +49,7 @@ description: 这个 skill 用于本仓库中的重要工作，在宣布完成前
 3. 哪些行为已经在 runtime 代码里被强制执行？
 4. 当前的验证证据是什么？
 5. 还有哪些 definition-of-done 门槛是开着的？
+6. `docs/interview-notes.md` 和 `docs/progress.md` 这次是否已经同步？
 
 只要还有门槛没关，就要直说还没完成，不能把工作包装成“已经做完”。
 

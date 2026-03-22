@@ -17,6 +17,9 @@ description: 这个 skill 用于本仓库的功能开发，要求所有交付都
 4. 只实现能推进这个 goal 的工作。
 5. review 当前 goal 是否满足。
 6. 把应该沉淀的内容写成 memory。
+7. 如果这次改动改变了架构理解、实现进度或面试讲法，必须同步更新：
+   - `docs/interview-notes.md`
+   - `docs/progress.md`
 
 ## 最低表达结构
 
@@ -35,6 +38,7 @@ description: 这个 skill 用于本仓库的功能开发，要求所有交付都
 - 在 policy enforcement 还没落地前，不要先大量加工具。
 - 在 parent-child ownership 还没建模前，不要先做 subagent。
 - 如果只是存了聊天记录，不要说 memory 已经有进展。
+- 如果已经发生了关键实现变化，不要忘了同步更新面试文档和进度文档。
 
 ## 推荐用语
 

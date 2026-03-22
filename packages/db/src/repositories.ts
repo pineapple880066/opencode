@@ -1,20 +1,28 @@
+import { createHash } from "node:crypto";
+
 import type {
   Goal,
   MemoryRecord,
   Plan,
   Session,
   SessionSummary,
+  SubagentRun,
   Task,
   Workspace,
 } from "@agent-ide/core";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import type { GraphMessage, PersistedCheckpoint, ToolInvocationLog } from "@agent-ide/runtime";
 
 import type {
+  CheckpointRow,
   GoalRow,
   MemoryRow,
+  MessageRow,
   PlanRow,
   SessionRow,
+  SubagentRunRow,
   TaskRow,
+  ToolInvocationRow,
   WorkspaceRow,
 } from "./contracts.js";
 import type { SessionSummaryCache } from "./cache.js";
@@ -25,13 +33,71 @@ type GoalRecord = GoalRow & RowDataPacket;
 type PlanRecord = PlanRow & RowDataPacket;
 type TaskRecord = TaskRow & RowDataPacket;
 type MemoryRecordRow = MemoryRow & RowDataPacket;
+type MessageRecord = MessageRow & RowDataPacket;
+type CheckpointRecord = CheckpointRow & RowDataPacket;
+type SubagentRunRecord = SubagentRunRow & RowDataPacket;
+type ToolInvocationRecord = ToolInvocationRow & RowDataPacket;
 
 function toJson<T>(value: T): string {
   return JSON.stringify(value);
 }
 
-function fromJson<T>(value: string): T {
-  return JSON.parse(value) as T;
+// mysql2 对 JSON 列的返回形态并不总是一致：
+// 有时给字符串，有时直接给解析后的 JS 值。
+// 所以这里不能假设“只要是 JSON 列，就一定还需要 JSON.parse”。
+function fromJson<T>(value: string | T): T {
+  if (typeof value !== "string") {
+    return value;
+  }
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return value as T;
+  }
+}
+
+function toStoredJsonString(value: unknown): string {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+// 面试点：workspace.path 可能很长，直接在 utf8mb4 上做唯一索引会撞 MySQL key length 限制。
+// 这里保留原始 path 作为真实值，再额外存一份 path_hash 做稳定唯一键。
+function hashWorkspacePath(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+// 面试点：领域层统一用 ISO 时间串，MySQL 层统一用 DATETIME(3)。
+// 这个适配层的目的就是不让业务层为了数据库格式去改自己的时间表达。
+function toMySqlDateTime(value: string | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`无法转换为 MySQL DATETIME: ${value}`);
+  }
+
+  return date.toISOString().replace("T", " ").replace("Z", "");
+}
+
+function fromMySqlDateTime(value: string | Date | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toISOString();
 }
 
 function mapWorkspaceRow(row: WorkspaceRow): Workspace {
@@ -39,8 +105,8 @@ function mapWorkspaceRow(row: WorkspaceRow): Workspace {
     id: row.id,
     path: row.path,
     label: row.label,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+    updatedAt: fromMySqlDateTime(row.updated_at) ?? row.updated_at,
   };
 }
 
@@ -54,9 +120,9 @@ function mapSessionRow(row: SessionRow): Session {
     activeAgentMode: row.agent_mode as Session["activeAgentMode"],
     activeGoalId: row.active_goal_id,
     summary: fromJson<SessionSummary>(row.summary_json),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    archivedAt: row.archived_at,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+    updatedAt: fromMySqlDateTime(row.updated_at) ?? row.updated_at,
+    archivedAt: fromMySqlDateTime(row.archived_at),
   };
 }
 
@@ -69,9 +135,9 @@ function mapGoalRow(row: GoalRow): Goal {
     description: row.description,
     successCriteria: fromJson<string[]>(row.success_criteria_json),
     status: row.status as Goal["status"],
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    completedAt: row.completed_at,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+    updatedAt: fromMySqlDateTime(row.updated_at) ?? row.updated_at,
+    completedAt: fromMySqlDateTime(row.completed_at),
   };
 }
 
@@ -83,8 +149,8 @@ function mapPlanRow(row: PlanRow): Plan {
     status: row.status as Plan["status"],
     summary: row.summary,
     steps: fromJson<Plan["steps"]>(row.steps_json),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+    updatedAt: fromMySqlDateTime(row.updated_at) ?? row.updated_at,
   };
 }
 
@@ -99,8 +165,8 @@ function mapTaskRow(row: TaskRow): Task {
     status: row.status as Task["status"],
     inputSummary: row.input_summary,
     outputSummary: row.output_summary,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+    updatedAt: fromMySqlDateTime(row.updated_at) ?? row.updated_at,
   };
 }
 
@@ -114,8 +180,59 @@ function mapMemoryRow(row: MemoryRow): MemoryRecord {
     value: row.value,
     source: row.source,
     confidence: row.confidence,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+    updatedAt: fromMySqlDateTime(row.updated_at) ?? row.updated_at,
+  };
+}
+
+function mapMessageRow(row: MessageRow): GraphMessage {
+  return {
+    id: row.id,
+    role: row.role,
+    content: fromJson<string>(row.content_json),
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+  };
+}
+
+function mapCheckpointRow(row: CheckpointRow): PersistedCheckpoint {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    node: row.node as PersistedCheckpoint["node"],
+    stateJson: toStoredJsonString(row.state_json),
+    summary: row.summary,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+  };
+}
+
+function mapSubagentRunRow(row: SubagentRunRow): SubagentRun {
+  return {
+    id: row.id,
+    parentSessionId: row.parent_session_id,
+    childSessionId: row.child_session_id,
+    parentTaskId: row.parent_task_id,
+    agentMode: row.agent_mode as SubagentRun["agentMode"],
+    status: row.status as SubagentRun["status"],
+    reason: row.reason,
+    inputSummary: row.input_summary,
+    resultSummary: row.result_summary,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+    updatedAt: fromMySqlDateTime(row.updated_at) ?? row.updated_at,
+  };
+}
+
+function mapToolInvocationRow(row: ToolInvocationRow): ToolInvocationLog {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    taskId: row.task_id,
+    subagentRunId: row.subagent_run_id,
+    toolName: row.tool_name,
+    inputJson: toStoredJsonString(row.input_json),
+    status: row.status,
+    outputJson: row.output_json ? toStoredJsonString(row.output_json) : undefined,
+    createdAt: fromMySqlDateTime(row.created_at) ?? row.created_at,
+    updatedAt: fromMySqlDateTime(row.updated_at) ?? row.updated_at,
   };
 }
 
@@ -123,23 +240,43 @@ export class MySqlWorkspaceRepository {
   constructor(private readonly pool: Pool) {}
 
   async upsert(workspace: Workspace): Promise<void> {
+    const pathHash = hashWorkspacePath(workspace.path);
+
     await this.pool.execute<ResultSetHeader>(
       `
-        INSERT INTO workspaces (id, path, label, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO workspaces (id, path, path_hash, label, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
           path = VALUES(path),
+          path_hash = VALUES(path_hash),
           label = VALUES(label),
           updated_at = VALUES(updated_at)
       `,
-      [workspace.id, workspace.path, workspace.label, workspace.createdAt, workspace.updatedAt],
+      [
+        workspace.id,
+        workspace.path,
+        pathHash,
+        workspace.label,
+        toMySqlDateTime(workspace.createdAt),
+        toMySqlDateTime(workspace.updatedAt),
+      ],
     );
   }
 
   async getByPath(path: string): Promise<Workspace | null> {
+    const pathHash = hashWorkspacePath(path);
     const [rows] = await this.pool.query<WorkspaceRecord[]>(
-      `SELECT * FROM workspaces WHERE path = ? LIMIT 1`,
-      [path],
+      `SELECT * FROM workspaces WHERE path_hash = ? AND path = ? LIMIT 1`,
+      [pathHash, path],
+    );
+
+    return rows[0] ? mapWorkspaceRow(rows[0]) : null;
+  }
+
+  async getById(id: string): Promise<Workspace | null> {
+    const [rows] = await this.pool.query<WorkspaceRecord[]>(
+      `SELECT * FROM workspaces WHERE id = ? LIMIT 1`,
+      [id],
     );
 
     return rows[0] ? mapWorkspaceRow(rows[0]) : null;
@@ -170,9 +307,9 @@ export class MySqlSessionRepository {
         session.activeAgentMode,
         session.activeGoalId ?? null,
         toJson(session.summary),
-        session.createdAt,
-        session.updatedAt,
-        session.archivedAt ?? null,
+        toMySqlDateTime(session.createdAt),
+        toMySqlDateTime(session.updatedAt),
+        toMySqlDateTime(session.archivedAt),
       ],
     );
 
@@ -217,10 +354,23 @@ export class MySqlSessionRepository {
     return rows.map((row) => mapSessionRow(row));
   }
 
+  async listByParentSession(parentSessionId: string): Promise<Session[]> {
+    const [rows] = await this.pool.query<SessionRecord[]>(
+      `
+        SELECT * FROM sessions
+        WHERE parent_session_id = ?
+        ORDER BY created_at ASC
+      `,
+      [parentSessionId],
+    );
+
+    return rows.map((row) => mapSessionRow(row));
+  }
+
   async rename(sessionId: string, title: string, updatedAt: string): Promise<void> {
     await this.pool.execute<ResultSetHeader>(
       `UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?`,
-      [title, updatedAt, sessionId],
+      [title, toMySqlDateTime(updatedAt), sessionId],
     );
   }
 
@@ -231,7 +381,7 @@ export class MySqlSessionRepository {
         SET status = 'archived', archived_at = ?, updated_at = ?
         WHERE id = ?
       `,
-      [archivedAt, archivedAt, sessionId],
+      [toMySqlDateTime(archivedAt), toMySqlDateTime(archivedAt), sessionId],
     );
   }
 
@@ -242,7 +392,7 @@ export class MySqlSessionRepository {
         SET summary_json = ?, updated_at = ?
         WHERE id = ?
       `,
-      [toJson(summary), updatedAt, sessionId],
+      [toJson(summary), toMySqlDateTime(updatedAt), sessionId],
     );
 
     if (this.summaryCache) {
@@ -257,7 +407,7 @@ export class MySqlSessionRepository {
         SET active_goal_id = ?, updated_at = ?
         WHERE id = ?
       `,
-      [goalId, updatedAt, sessionId],
+      [goalId, toMySqlDateTime(updatedAt), sessionId],
     );
   }
 }
@@ -282,9 +432,9 @@ export class MySqlGoalRepository {
         goal.description,
         toJson(goal.successCriteria),
         goal.status,
-        goal.createdAt,
-        goal.updatedAt,
-        goal.completedAt ?? null,
+        toMySqlDateTime(goal.createdAt),
+        toMySqlDateTime(goal.updatedAt),
+        toMySqlDateTime(goal.completedAt),
       ],
     );
   }
@@ -318,7 +468,7 @@ export class MySqlGoalRepository {
         SET status = ?, updated_at = ?, completed_at = ?
         WHERE id = ?
       `,
-      [status, updatedAt, completedAt ?? null, id],
+      [status, toMySqlDateTime(updatedAt), toMySqlDateTime(completedAt), id],
     );
   }
 }
@@ -344,8 +494,8 @@ export class MySqlPlanRepository {
         plan.status,
         plan.summary,
         toJson(plan.steps),
-        plan.createdAt,
-        plan.updatedAt,
+        toMySqlDateTime(plan.createdAt),
+        toMySqlDateTime(plan.updatedAt),
       ],
     );
   }
@@ -367,6 +517,19 @@ export class MySqlPlanRepository {
 
 export class MySqlTaskRepository {
   constructor(private readonly pool: Pool) {}
+
+  async getById(id: string): Promise<Task | null> {
+    const [rows] = await this.pool.query<TaskRecord[]>(
+      `
+        SELECT * FROM tasks
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [id],
+    );
+
+    return rows[0] ? mapTaskRow(rows[0]) : null;
+  }
 
   async upsertMany(tasks: Task[]): Promise<void> {
     if (tasks.length === 0) {
@@ -399,8 +562,8 @@ export class MySqlTaskRepository {
           task.status,
           task.inputSummary,
           task.outputSummary ?? null,
-          task.createdAt,
-          task.updatedAt,
+          toMySqlDateTime(task.createdAt),
+          toMySqlDateTime(task.updatedAt),
         ],
       );
     }
@@ -441,8 +604,8 @@ export class MySqlMemoryRepository {
         record.value,
         record.source,
         record.confidence,
-        record.createdAt,
-        record.updatedAt,
+        toMySqlDateTime(record.createdAt),
+        toMySqlDateTime(record.updatedAt),
       ],
     );
   }
@@ -467,5 +630,195 @@ export class MySqlMemoryRepository {
         );
 
     return rows.map((row) => mapMemoryRow(row));
+  }
+}
+
+export class MySqlMessageRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async append(sessionId: string, message: GraphMessage): Promise<void> {
+    await this.pool.execute<ResultSetHeader>(
+      `
+        INSERT INTO messages (id, session_id, role, content_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `,
+      [message.id, sessionId, message.role, toJson(message.content), toMySqlDateTime(message.createdAt)],
+    );
+  }
+
+  async listBySession(sessionId: string): Promise<GraphMessage[]> {
+    const [rows] = await this.pool.query<MessageRecord[]>(
+      `
+        SELECT * FROM messages
+        WHERE session_id = ?
+        ORDER BY created_at ASC
+      `,
+      [sessionId],
+    );
+
+    return rows.map((row) => mapMessageRow(row));
+  }
+}
+
+export class MySqlCheckpointRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async create(checkpoint: PersistedCheckpoint): Promise<void> {
+    await this.pool.execute<ResultSetHeader>(
+      `
+        INSERT INTO checkpoints (id, session_id, node, state_json, summary, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `,
+      [
+        checkpoint.id,
+        checkpoint.sessionId,
+        checkpoint.node,
+        checkpoint.stateJson,
+        checkpoint.summary,
+        toMySqlDateTime(checkpoint.createdAt),
+      ],
+    );
+  }
+
+  async listBySession(sessionId: string): Promise<PersistedCheckpoint[]> {
+    const [rows] = await this.pool.query<CheckpointRecord[]>(
+      `
+        SELECT * FROM checkpoints
+        WHERE session_id = ?
+        ORDER BY created_at DESC
+      `,
+      [sessionId],
+    );
+
+    return rows.map((row) => mapCheckpointRow(row));
+  }
+}
+
+export class MySqlSubagentRunRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async create(run: SubagentRun): Promise<void> {
+    await this.pool.execute<ResultSetHeader>(
+      `
+        INSERT INTO subagent_runs (
+          id, parent_session_id, child_session_id, parent_task_id,
+          agent_mode, status, reason, input_summary, result_summary,
+          created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        run.id,
+        run.parentSessionId,
+        run.childSessionId,
+        run.parentTaskId ?? null,
+        run.agentMode,
+        run.status,
+        run.reason,
+        run.inputSummary,
+        run.resultSummary ?? null,
+        toMySqlDateTime(run.createdAt),
+        toMySqlDateTime(run.updatedAt),
+      ],
+    );
+  }
+
+  async getById(id: string): Promise<SubagentRun | null> {
+    const [rows] = await this.pool.query<SubagentRunRecord[]>(
+      `
+        SELECT * FROM subagent_runs
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [id],
+    );
+
+    return rows[0] ? mapSubagentRunRow(rows[0]) : null;
+  }
+
+  async complete(
+    id: string,
+    status: SubagentRun["status"],
+    resultSummary: string | undefined,
+    updatedAt: string,
+  ): Promise<void> {
+    await this.pool.execute<ResultSetHeader>(
+      `
+        UPDATE subagent_runs
+        SET status = ?, result_summary = ?, updated_at = ?
+        WHERE id = ?
+      `,
+      [status, resultSummary ?? null, toMySqlDateTime(updatedAt), id],
+    );
+  }
+
+  async listByParentSession(parentSessionId: string): Promise<SubagentRun[]> {
+    const [rows] = await this.pool.query<SubagentRunRecord[]>(
+      `
+        SELECT * FROM subagent_runs
+        WHERE parent_session_id = ?
+        ORDER BY created_at DESC
+      `,
+      [parentSessionId],
+    );
+
+    return rows.map((row) => mapSubagentRunRow(row));
+  }
+}
+
+export class MySqlToolInvocationRepository {
+  constructor(private readonly pool: Pool) {}
+
+  async start(log: ToolInvocationLog): Promise<void> {
+    await this.pool.execute<ResultSetHeader>(
+      `
+        INSERT INTO tool_invocations (
+          id, session_id, task_id, subagent_run_id,
+          tool_name, input_json, status, output_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        log.id,
+        log.sessionId,
+        log.taskId ?? null,
+        log.subagentRunId ?? null,
+        log.toolName,
+        log.inputJson,
+        log.status,
+        log.outputJson ?? null,
+        toMySqlDateTime(log.createdAt),
+        toMySqlDateTime(log.updatedAt),
+      ],
+    );
+  }
+
+  async finish(
+    id: string,
+    status: ToolInvocationLog["status"],
+    outputJson: string | undefined,
+    updatedAt: string,
+  ): Promise<void> {
+    await this.pool.execute<ResultSetHeader>(
+      `
+        UPDATE tool_invocations
+        SET status = ?, output_json = ?, updated_at = ?
+        WHERE id = ?
+      `,
+      [status, outputJson ?? null, toMySqlDateTime(updatedAt), id],
+    );
+  }
+
+  async listBySession(sessionId: string): Promise<ToolInvocationLog[]> {
+    const [rows] = await this.pool.query<ToolInvocationRecord[]>(
+      `
+        SELECT * FROM tool_invocations
+        WHERE session_id = ?
+        ORDER BY created_at DESC
+      `,
+      [sessionId],
+    );
+
+    return rows.map((row) => mapToolInvocationRow(row));
   }
 }

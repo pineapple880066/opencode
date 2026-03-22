@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { loadWorkspaceEnv } from "./env.js";
+
 const persistenceEnvSchema = z.object({
   MYSQL_HOST: z.string().min(1).default("127.0.0.1"),
   MYSQL_PORT: z.coerce.number().int().positive().default(3306),
@@ -43,7 +45,8 @@ export interface PersistenceConfig {
 }
 
 export function readPersistenceConfig(env: NodeJS.ProcessEnv = process.env): PersistenceConfig {
-  const parsed = persistenceEnvSchema.parse(env);
+  const sourceEnv = env === process.env ? loadWorkspaceEnv() : env;
+  const parsed = persistenceEnvSchema.parse(sourceEnv);
 
   return {
     mysql: {
@@ -66,4 +69,3 @@ export function readPersistenceConfig(env: NodeJS.ProcessEnv = process.env): Per
     },
   };
 }
-

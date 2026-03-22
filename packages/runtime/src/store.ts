@@ -1,4 +1,5 @@
 import type {
+  SubagentRun,
   Goal,
   MemoryRecord,
   Plan,
@@ -7,11 +8,13 @@ import type {
   Task,
   Workspace,
 } from "@agent-ide/core";
+import type { GraphCheckpoint, GraphMessage, WorkflowNode } from "./graph.js";
 
 // RuntimeStore 是 runtime 访问持久化层的统一入口。
 // runtime 只依赖这组合同，不直接依赖具体的 MySQL/Redis 实现。
 export interface WorkspaceStore {
   upsert(workspace: Workspace): Promise<void>;
+  getById(id: string): Promise<Workspace | null>;
   getByPath(path: string): Promise<Workspace | null>;
 }
 
@@ -19,6 +22,7 @@ export interface SessionStore {
   create(session: Session): Promise<void>;
   getById(id: string): Promise<Session | null>;
   listByWorkspace(workspaceId: string): Promise<Session[]>;
+  listByParentSession(parentSessionId: string): Promise<Session[]>;
   rename(sessionId: string, title: string, updatedAt: string): Promise<void>;
   archive(sessionId: string, archivedAt: string): Promise<void>;
   updateSummary(sessionId: string, summary: SessionSummary, updatedAt: string): Promise<void>;
@@ -38,6 +42,7 @@ export interface PlanStore {
 }
 
 export interface TaskStore {
+  getById(id: string): Promise<Task | null>;
   upsertMany(tasks: Task[]): Promise<void>;
   listBySession(sessionId: string): Promise<Task[]>;
 }
@@ -51,6 +56,56 @@ export interface MemoryStore {
   ): Promise<MemoryRecord[]>;
 }
 
+export interface PersistedCheckpoint extends GraphCheckpoint {
+  stateJson: string;
+}
+
+export interface ToolInvocationLog {
+  id: string;
+  sessionId: string;
+  taskId?: string;
+  subagentRunId?: string;
+  toolName: string;
+  inputJson: string;
+  status: "started" | "completed" | "failed";
+  outputJson?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MessageStore {
+  append(sessionId: string, message: GraphMessage): Promise<void>;
+  listBySession(sessionId: string): Promise<GraphMessage[]>;
+}
+
+export interface CheckpointStore {
+  create(checkpoint: PersistedCheckpoint): Promise<void>;
+  listBySession(sessionId: string): Promise<PersistedCheckpoint[]>;
+}
+
+export interface SubagentRunStore {
+  create(run: SubagentRun): Promise<void>;
+  getById(id: string): Promise<SubagentRun | null>;
+  complete(
+    id: string,
+    status: SubagentRun["status"],
+    resultSummary: string | undefined,
+    updatedAt: string,
+  ): Promise<void>;
+  listByParentSession(parentSessionId: string): Promise<SubagentRun[]>;
+}
+
+export interface ToolInvocationStore {
+  start(log: ToolInvocationLog): Promise<void>;
+  finish(
+    id: string,
+    status: ToolInvocationLog["status"],
+    outputJson: string | undefined,
+    updatedAt: string,
+  ): Promise<void>;
+  listBySession(sessionId: string): Promise<ToolInvocationLog[]>;
+}
+
 export interface RuntimeStore {
   workspaces: WorkspaceStore;
   sessions: SessionStore;
@@ -58,5 +113,8 @@ export interface RuntimeStore {
   plans: PlanStore;
   tasks: TaskStore;
   memory: MemoryStore;
+  messages: MessageStore;
+  checkpoints: CheckpointStore;
+  subagentRuns: SubagentRunStore;
+  toolInvocations: ToolInvocationStore;
 }
-

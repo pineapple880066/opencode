@@ -6,4 +6,5 @@ dist
 .env.local
 .idea
 .vscode/settings.json
-
+docs
+.codex/skills

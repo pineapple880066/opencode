@@ -42,6 +42,22 @@ export interface GraphCheckpoint {
   summary: string;
 }
 
+// 最近的工具调用同样属于 runtime state。
+// execute 节点是否已经读过某个文件、是否正在重复同一个工具动作，
+// 都要靠这组痕迹来判断。
+export interface GraphToolInvocation {
+  id: Identifier;
+  sessionId: Identifier;
+  taskId?: Identifier;
+  subagentRunId?: Identifier;
+  toolName: string;
+  status: "started" | "completed" | "failed";
+  inputJson: string;
+  outputJson?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 // AgentGraphState 是运行中的状态快照，后面会自然映射到 LangGraph state。
 // 只要某个东西会影响执行，就应该在这里能看到，而不是藏在零散局部变量里。
 export interface AgentGraphState {
@@ -51,6 +67,7 @@ export interface AgentGraphState {
   currentPlan?: Plan;
   tasks: Task[];
   messages: GraphMessage[];
+  toolInvocations: GraphToolInvocation[];
   memory: MemoryRecord[];
   activeAgent: AgentMode;
   activePolicy: ToolPolicy;

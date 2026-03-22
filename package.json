@@ -6,13 +6,27 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "check": "pnpm typecheck",
-    "dev": "node -e \"console.log('Scaffold created. Next milestone: wire the runtime graph and persistence.');\""
+    "test": "tsx --test apps/**/*.test.ts packages/**/*.test.ts",
+    "dev": "node -e \"console.log('Scaffold created. Use pnpm smoke:persistence after MySQL and Redis are ready.');\"",
+    "dev:ide-web": "tsx apps/ide-web/src/dev-server.ts",
+    "infra:up": "docker compose up -d --wait mysql redis",
+    "infra:down": "docker compose down",
+    "infra:reset": "docker compose down -v --remove-orphans",
+    "infra:logs": "docker compose logs -f mysql redis",
+    "infra:ps": "docker compose ps -a",
+    "smoke:minimax": "tsx packages/evals/src/minimax-smoke.ts",
+    "smoke:persistence": "tsx packages/evals/src/persistence-smoke.ts"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.8.2"
   },
   "dependencies": {
+    "@langchain/core": "^1.1.34",
+    "@langchain/langgraph": "^1.2.5",
+    "@langchain/langgraph-checkpoint": "^1.0.1",
+    "dotenv": "^17.3.1",
     "mysql2": "^3.20.0",
     "redis": "^5.11.0",
     "zod": "^4.3.6"
