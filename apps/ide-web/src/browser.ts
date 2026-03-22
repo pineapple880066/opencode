@@ -197,6 +197,25 @@ function buildBrowserRuntimeScript(): string {
     return params.toString();
   }
 
+  async function readApiPayload(response) {
+    const rawText = await response.text();
+    const contentType = response.headers.get("content-type") || "";
+
+    if (contentType.includes("application/json")) {
+      try {
+        return JSON.parse(rawText || "{}");
+      } catch {
+        return { error: rawText || \`HTTP \${response.status}\` };
+      }
+    }
+
+    if (!rawText) {
+      return {};
+    }
+
+    return { error: rawText };
+  }
+
   function isPanelId(value) {
     return value === "workbench"
       || value === "goal"
@@ -404,7 +423,7 @@ function buildBrowserRuntimeScript(): string {
           prompt,
         }),
       });
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
 
       if (!response.ok) {
         throw new Error(payload.error || \`HTTP \${response.status}\`);
@@ -458,7 +477,7 @@ function buildBrowserRuntimeScript(): string {
           terminalPane: terminalPane === "collapsed" ? "collapsed" : "open",
         }),
       });
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
 
       if (!response.ok) {
         throw new Error(payload.error || \`HTTP \${response.status}\`);
@@ -512,7 +531,7 @@ function buildBrowserRuntimeScript(): string {
           command,
         }),
       });
-      const payload = await response.json();
+      const payload = await readApiPayload(response);
 
       if (!response.ok) {
         throw new Error(payload.error || \`HTTP \${response.status}\`);

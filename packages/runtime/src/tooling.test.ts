@@ -175,6 +175,89 @@ describe("RuntimeToolExecutor", () => {
     assert.equal(diskContent, "hello planning mode");
   });
 
+  test("build 模式的 view 工具兼容 lineRange 范围参数", async () => {
+    const store = new InMemoryRuntimeStore();
+    store.sessionMap.set("session_view_range", {
+      id: "session_view_range",
+      workspaceId: "workspace_1",
+      title: "view range session",
+      status: "active",
+      activeAgentMode: "build",
+      summary: {
+        shortSummary: "",
+        openLoops: [],
+        nextActions: [],
+        importantFacts: [],
+      } satisfies SessionSummary,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    await writeFile(
+      path.join(workspaceRoot, "notes", "range.txt"),
+      ["line 1", "line 2", "line 3", "line 4", "line 5"].join("\n"),
+      "utf8",
+    );
+
+    const executor = new RuntimeToolExecutor(store, createBuiltinToolRegistry());
+    const viewResult = await executor.execute<any, { content: string; startLine: number; endLine: number }>({
+      sessionId: "session_view_range",
+      name: "view",
+      input: {
+        root: workspaceRoot,
+        path: "notes/range.txt",
+        lineRange: "2-4",
+      },
+    });
+
+    assert.equal(viewResult.ok, true);
+    assert.equal(viewResult.output?.startLine, 2);
+    assert.equal(viewResult.output?.endLine, 4);
+    assert.equal(viewResult.output?.content, ["line 2", "line 3", "line 4"].join("\n"));
+  });
+
+  test("build 模式的 view 工具兼容 offset/limit 分页参数", async () => {
+    const store = new InMemoryRuntimeStore();
+    store.sessionMap.set("session_view_offset_limit", {
+      id: "session_view_offset_limit",
+      workspaceId: "workspace_1",
+      title: "view offset limit session",
+      status: "active",
+      activeAgentMode: "build",
+      summary: {
+        shortSummary: "",
+        openLoops: [],
+        nextActions: [],
+        importantFacts: [],
+      } satisfies SessionSummary,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    await writeFile(
+      path.join(workspaceRoot, "notes", "offset-limit.txt"),
+      ["alpha", "beta", "gamma", "delta", "epsilon"].join("\n"),
+      "utf8",
+    );
+
+    const executor = new RuntimeToolExecutor(store, createBuiltinToolRegistry());
+    const viewResult = await executor.execute<any, { content: string; startLine: number; endLine: number }>({
+      sessionId: "session_view_offset_limit",
+      name: "view",
+      input: {
+        root: workspaceRoot,
+        path: "notes/offset-limit.txt",
+        offset: 1,
+        limit: 2,
+      },
+    });
+
+    assert.equal(viewResult.ok, true);
+    assert.equal(viewResult.output?.startLine, 2);
+    assert.equal(viewResult.output?.endLine, 3);
+    assert.equal(viewResult.output?.content, ["beta", "gamma"].join("\n"));
+  });
+
   test("plan 模式会真实拒绝写工具", async () => {
     const store = new InMemoryRuntimeStore();
     store.sessionMap.set("session_plan", {

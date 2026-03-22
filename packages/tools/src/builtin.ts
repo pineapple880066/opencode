@@ -35,6 +35,8 @@ export interface ListOutput {
 export interface ViewInput extends WorkspaceBoundInput {
   startLine?: number;
   endLine?: number;
+  offset?: number;
+  limit?: number;
 }
 
 export interface ViewOutput {
@@ -173,6 +175,68 @@ function normalizeWorkspacePathInput(input: WorkspaceBoundInput): string {
   return aliasedPath ?? ".";
 }
 
+// 这次 mixed explain + edit bug 暴露出另一个很现实的问题：
+// 模型会把“按行读取”写成 lineRange: "1-70" 这种字符串，
+// 但我们原来的 view 工具只认 startLine / endLine。
+//
+// 结果就是：
+// - 模型以为自己在缩小范围重读
+// - 工具层实际上没有真正理解这个字段
+// - runtime 又只看到“又来了一次新的 view”
+//
+// 所以这里专门补一个 lineRange 解析层，把常见的 "start-end" 形式转成内部标准字段。
+function parseLineRangeAlias(value: unknown): { startLine?: number; endLine?: number } {
+  const lineRange = pickStringAlias(value, ["lineRange", "line_range"]);
+  if (!lineRange) {
+    return {};
+  }
+
+  const matched = lineRange.trim().match(/^(\d+)\s*-\s*(\d+)$/);
+  if (!matched) {
+    return {};
+  }
+
+  const startLine = Number(matched[1]);
+  const endLine = Number(matched[2]);
+
+  if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) {
+    return {};
+  }
+
+  return {
+    startLine,
+    endLine,
+  };
+}
+
+// view 工具现在会先走一层规范化：
+// 1. 路径兼容 path / file_path / filePath
+// 2. 行范围兼容 startLine/endLine、start_line/end_line、lineRange
+//
+// 这样做的原因不是“让模型随便输出都行”，
+// 而是把常见外部 agent 风格先收敛到统一合同里，
+// 减少工具协议阻抗导致的假失败或假循环。
+function normalizeViewInput(input: ViewInput): ViewInput {
+  const lineRange = parseLineRangeAlias(input);
+  const offset = pickNumberAlias(input, ["offset"]);
+  const limit = pickNumberAlias(input, ["limit"]);
+
+  return {
+    ...input,
+    path: normalizeWorkspacePathInput(input),
+    startLine:
+      pickNumberAlias(input, ["startLine", "start_line"]) ??
+      lineRange.startLine ??
+      input.startLine,
+    endLine:
+      pickNumberAlias(input, ["endLine", "end_line"]) ??
+      lineRange.endLine ??
+      input.endLine,
+    offset: offset ?? input.offset,
+    limit: limit ?? input.limit,
+  };
+}
+
 function normalizeWriteInput(input: WriteInput): WriteInput {
   return {
     ...input,
@@ -272,12 +336,26 @@ async function listTool(input: ListInput): Promise<ListOutput> {
 }
 
 async function viewTool(input: ViewInput): Promise<ViewOutput> {
-  const root = path.resolve(input.root);
-  const targetPath = resolveWithinRoot(root, normalizeWorkspacePathInput(input));
+  const normalizedInput = normalizeViewInput(input);
+  const root = path.resolve(normalizedInput.root);
+  const targetPath = resolveWithinRoot(root, normalizedInput.path);
   const content = await readFile(targetPath, "utf8");
   const lines = content.split(/\r?\n/);
-  const startLine = Math.max(1, input.startLine ?? 1);
-  const endLine = Math.min(lines.length, input.endLine ?? lines.length);
+
+  // 显式分页合同：
+  // - 首选 startLine/endLine（1-based，最适合源码阅读）
+  // - 兼容 offset/limit（offset 为 0-based 行偏移，limit 为读取行数）
+  //
+  // 这样 executor 可以更明确地表达“整文件读取”或“局部精读”，
+  // 不需要再把 lineRange 这种字符串别名当成主要合同。
+  const derivedStartLine =
+    normalizedInput.startLine ??
+    (normalizedInput.offset !== undefined ? Math.max(1, normalizedInput.offset + 1) : 1);
+  const startLine = Math.max(1, derivedStartLine);
+  const derivedEndLine =
+    normalizedInput.endLine ??
+    (normalizedInput.limit !== undefined ? startLine + Math.max(0, normalizedInput.limit) - 1 : lines.length);
+  const endLine = Math.min(lines.length, Math.max(startLine, derivedEndLine));
   const sliced = lines.slice(startLine - 1, endLine).join("\n");
 
   return {

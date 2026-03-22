@@ -88,6 +88,13 @@ function writeResponse(
   response.end();
 }
 
+function isJsonApiPath(pathname: string, options: IdeShellServerOptions): boolean {
+  return pathname === (options.statePath ?? "/__ide__/state")
+    || pathname === (options.invokePath ?? "/__ide__/invoke")
+    || pathname === (options.saveFilePath ?? "/__ide__/save-file")
+    || pathname === (options.terminalRunPath ?? "/__ide__/terminal/run");
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
 
@@ -381,6 +388,29 @@ export function createIdeShellRequestHandler(
       writeResponse(response, 404, "text/plain; charset=utf-8", "Not Found", request.method);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown Error";
+      console.error("[agent-ide] IDE shell request failed", {
+        method: request.method,
+        url: request.url,
+        error,
+      });
+
+      if (request.url) {
+        const origin = `http://${request.headers.host ?? "127.0.0.1"}`;
+        const requestUrl = new URL(request.url, origin);
+        if (isJsonApiPath(requestUrl.pathname, options)) {
+          writeResponse(
+            response,
+            500,
+            "application/json; charset=utf-8",
+            JSON.stringify({
+              error: message,
+            }),
+            request.method,
+          );
+          return;
+        }
+      }
+
       writeResponse(response, 500, "text/plain; charset=utf-8", message, request.method);
     }
   };

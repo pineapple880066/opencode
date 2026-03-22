@@ -151,6 +151,44 @@ describe("ide shell server", () => {
     }
   });
 
+  test("invoke handler 抛错时，会返回 JSON error，而不是纯文本 500", async () => {
+    const service = await seedIdeShellService();
+    const server = createIdeShellServer(service, {
+      defaultWorkspacePath: "/tmp/project",
+      invoke: async () => {
+        throw new Error("invoke exploded");
+      },
+    });
+
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("server address is not available");
+      }
+
+      const response = await fetch(`http://127.0.0.1:${address.port}/__ide__/invoke`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          workspacePath: "/tmp/project",
+          prompt: "boom",
+        }),
+      });
+      const payload = (await response.json()) as { error: string };
+
+      assert.equal(response.status, 500);
+      assert.equal(payload.error, "invoke exploded");
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+  });
+
   test("会接收文件保存请求，并返回 files 面板导航", async () => {
     const service = await seedIdeShellService();
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-server-"));

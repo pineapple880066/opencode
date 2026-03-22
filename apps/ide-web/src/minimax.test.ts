@@ -285,6 +285,47 @@ describe("MiniMax hooks", () => {
     assert.deepEqual(goal?.successCriteria, ["结构合法", "可执行", "可验证"]);
   });
 
+  test("语法损坏的 JSON 会触发一次 syntax repair 重试", async () => {
+    let requestCount = 0;
+    let syntaxRepairSeen = false;
+
+    const hooks = createMiniMaxHooks({
+      env: {
+        MINIMAX_API_KEY: "test-key",
+      },
+      fetchImpl: createRecordingMockFetch(
+        [
+          "{\"title\":\"创建 Agent IDE Goal\",\"description\":\"第一版 JSON 缺了数组逗号\",\"successCriteria\":[\"先创建 goal\" \"再生成计划\"]}",
+          JSON.stringify({
+            title: "创建 Agent IDE Goal",
+            description: "修复语法后返回合法的 goal。",
+            successCriteria: ["先创建 goal", "再生成计划"],
+          }),
+        ],
+        (requestBody, index) => {
+          requestCount += 1;
+          const messages = Array.isArray(requestBody.messages)
+            ? (requestBody.messages as Array<{ role?: string; content?: string }>)
+            : [];
+          const userContent = messages.find((message) => message.role === "user")?.content ?? "";
+          if (index === 1 && typeof userContent === "string" && userContent.includes("syntaxError:")) {
+            syntaxRepairSeen = true;
+          }
+        },
+      ),
+    });
+
+    const goal = await hooks.goalFactory?.({
+      sessionId: "session_parent",
+      userMessage: "请创建一个 goal",
+    });
+
+    assert.equal(requestCount, 2);
+    assert.equal(syntaxRepairSeen, true);
+    assert.equal(goal?.title, "创建 Agent IDE Goal");
+    assert.deepEqual(goal?.successCriteria, ["先创建 goal", "再生成计划"]);
+  });
+
   test("executor 会用当前 state 补全缺失的 task 字段，并丢弃空 memory 项", async () => {
     const state: AgentGraphState = {
       workspaceId: "workspace_1",
@@ -438,6 +479,7 @@ describe("MiniMax hooks", () => {
       },
       fetchImpl: createMockFetch([
         JSON.stringify({
+          executionPhase: "analysis",
           assistantMessage: "先读取 bootstrap.ts。",
           toolCalls: [
             {
@@ -468,6 +510,7 @@ describe("MiniMax hooks", () => {
       userMessage: "在 bootstrap.ts 里加两行注释",
     });
 
+    assert.equal(execution?.executionPhase, "explain");
     assert.equal(execution?.toolCalls?.length, 2);
     assert.equal(execution?.toolCalls?.[0]?.name, "view");
     assert.equal(execution?.toolCalls?.[0]?.input.path, "apps/ide-web/src/bootstrap.ts");

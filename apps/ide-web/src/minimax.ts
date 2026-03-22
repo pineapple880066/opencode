@@ -473,6 +473,25 @@ function sanitizeExecutorCandidate(value: unknown, state?: AgentGraphState): unk
     : undefined;
 
   return {
+    executionPhase: normalizeEnumInput(
+      value.executionPhase,
+      {
+        explain: "explain",
+        explain_phase: "explain",
+        analysis: "explain",
+        analyze: "explain",
+        read: "explain",
+        inspect: "explain",
+        modify: "modify",
+        edit: "modify",
+        write: "modify",
+        patch: "modify",
+        finalize: "finalize",
+        final: "finalize",
+        summarize: "finalize",
+        summary: "finalize",
+      },
+    ),
     assistantMessage: sanitizeStringValue(value.assistantMessage, 2000),
     tasks,
     memory,
@@ -563,6 +582,26 @@ const delegateSchema = z.object({
 });
 
 const executorSchema = z.object({
+  executionPhase: z.preprocess(
+    (value) =>
+      normalizeEnumInput(value, {
+        explain: "explain",
+        explain_phase: "explain",
+        analysis: "explain",
+        analyze: "explain",
+        read: "explain",
+        inspect: "explain",
+        modify: "modify",
+        edit: "modify",
+        write: "modify",
+        patch: "modify",
+        finalize: "finalize",
+        final: "finalize",
+        summarize: "finalize",
+        summary: "finalize",
+      }),
+    z.enum(["explain", "modify", "finalize"]),
+  ).optional(),
   assistantMessage: z.string().min(1).max(2000).optional(),
   tasks: z
     .array(
@@ -732,6 +771,47 @@ function previewJsonString(value: string | undefined, maxLength: number): string
   }
 }
 
+// 这两个 preview 函数是修这次结构性 bug 的关键。
+//
+// 问题背景：
+// executor 的下一轮判断，不是直接读取真实文件系统，而是基于 runtimeState digest。
+// 这个 digest 里会带上 recentMessages / recentToolInvocations，喂给模型做“上一轮发生了什么”的摘要。
+//
+// 原来的问题是：
+// - tool=view 的输出太长，所以被截得很短
+// - 下一轮模型其实看不到完整文件内容
+// - 它就会继续发新的 view，想“再读一点”
+//
+// 所以这里故意对 view 提高摘要预算：
+// - 普通 message 仍然保持较短
+// - 但 tool=view 的 message / output 会保留更长片段
+//
+// 这不是为了把上下文无限堆大，而是为了让模型至少拿到“已经足够继续 edit”的信息，
+// 不至于因为摘要太短而把所有工具轮次都浪费在重复读取上。
+function previewMessageForDigest(
+  message: Pick<AgentGraphState["messages"][number], "role" | "content">,
+): string {
+  if (message.role !== "tool") {
+    return truncate(message.content, 320);
+  }
+
+  if (message.content.includes("tool=view")) {
+    return truncate(message.content, 2800);
+  }
+
+  return truncate(message.content, 800);
+}
+
+function previewToolInvocationOutputForDigest(
+  log: AgentGraphState["toolInvocations"][number],
+): string | undefined {
+  if (log.toolName === "view") {
+    return previewJsonString(log.outputJson, 2600);
+  }
+
+  return previewJsonString(log.outputJson, 600);
+}
+
 async function requestMiniMaxContent(
   config: MiniMaxConfig,
   fetchImpl: FetchLike,
@@ -808,7 +888,10 @@ function buildStateDigest(state: AgentGraphState): string {
     })),
     recentMessages: state.messages.slice(-6).map((message) => ({
       role: message.role,
-      content: truncate(message.content, 240),
+      // recentMessages 是 executor 最依赖的“上一轮证据”之一。
+      // 这里不能无脑统一截短，否则模型虽然看见了“有个 tool=view”，
+      // 却看不见关键源码片段，下一轮就更容易继续 view。
+      content: previewMessageForDigest(message),
       createdAt: message.createdAt,
     })),
     memory: state.memory.slice(-6).map((record) => ({
@@ -823,7 +906,10 @@ function buildStateDigest(state: AgentGraphState): string {
       taskId: log.taskId,
       status: log.status,
       input: previewJsonString(log.inputJson, 260),
-      output: previewJsonString(log.outputJson, 320),
+      // tool invocation 的 output 和 message 都会喂给模型。
+      // 这里单独放宽 view 的输出长度，是为了 mixed explain + edit 任务里，
+      // 模型能直接基于最近读取结果进入 edit，而不是再起一轮 view。
+      output: previewToolInvocationOutputForDigest(log),
       updatedAt: log.updatedAt,
     })),
     subagentRuns: state.subagentRuns.slice(-4).map((run) => ({
@@ -861,7 +947,48 @@ async function callMiniMaxJson<T>(
     },
   ]);
   const json = extractJsonObject(content);
-  const rawCandidate = JSON.parse(json);
+  let rawCandidate: unknown;
+
+  try {
+    rawCandidate = JSON.parse(json);
+  } catch (error) {
+    if (!(error instanceof SyntaxError) || !options?.repairHint) {
+      throw error;
+    }
+
+    const repairedContent = await requestMiniMaxContent(config, fetchImpl, [
+      {
+        role: "system",
+        content: [
+          buildBaseSystemPrompt("json-repair"),
+          "你负责修复一个语法损坏的 JSON object。",
+          "你只能输出修复后的 JSON object。",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: [
+          "下面这段 JSON 在语法层面就无法被解析，请修复它。",
+          `syntaxError: ${error.message}`,
+          `repairHint: ${options.repairHint}`,
+          `rawJson: ${truncate(json, 5000)}`,
+        ].join("\n"),
+      },
+    ]);
+    const repairedJson = extractJsonObject(repairedContent);
+
+    try {
+      rawCandidate = JSON.parse(repairedJson);
+    } catch (repairError) {
+      throw new Error(
+        `MiniMax JSON syntax repair failed: ${repairError instanceof Error ? repairError.message : "unknown parse error"}\nRaw JSON: ${truncate(
+          repairedJson,
+          1200,
+        )}`,
+      );
+    }
+  }
+
   const candidate = options?.sanitizer ? options.sanitizer(rawCandidate) : rawCandidate;
 
   try {
@@ -1046,7 +1173,8 @@ export function createMiniMaxHooks(options?: MiniMaxHooksOptions): LangGraphHook
         buildBaseSystemPrompt("executor"),
         [
           "请基于当前 runtimeState 输出执行结果草案。",
-          "输出字段：assistantMessage、tasks、memory、toolCalls。",
+          "输出字段：executionPhase、assistantMessage、tasks、memory、toolCalls。",
+          "executionPhase 只能是：explain、modify、finalize。",
           "tasks 用于同步 runtime task 账本；如果在更新已有 task，尽量复用现有 task id。",
           "task.status 只能是：todo、in_progress、blocked、done、canceled。",
           "memory.scope 只能是：session、workspace、user。",
@@ -1054,10 +1182,15 @@ export function createMiniMaxHooks(options?: MiniMaxHooksOptions): LangGraphHook
           "如果需要真实读写工作区文件，必须通过 toolCalls 请求工具，不要谎称已经改好了代码。",
           "toolCalls.name 只能是：list、view、grep、write、edit。",
           "toolCalls.input 里只写相对工作区的 path，不要写绝对路径，也不要自己传 root。",
+          "phase 规划规则：读懂/解释文件时用 explain；开始落改动时用 modify；给最终自然语言答复时用 finalize。",
+          "view 默认会返回整个文件；如果你只需要局部片段，优先传 startLine/endLine，也兼容 offset/limit 或 lineRange: \"1-80\"。",
           "读取文件前优先用 view；小改动优先用 edit；只有在你已经看过文件并且确定要整体覆盖时才用 write。",
           "如果 runtimeState.recentToolInvocations 里已经有刚刚完成的相同工具调用，不要重复同一个 name/path；你必须基于已有结果继续下一步。",
           "如果最近消息里出现 LOOP_GUARD，说明你已经在重复同一个工具调用了；下一轮必须改用 edit/write，或者直接输出最终 assistantMessage。",
           "当最近消息里已经有 tool=... 的工具结果时，你要基于这些结果决定下一轮 toolCalls，或者给出最终 assistantMessage。",
+          "reread policy：完整 view 之后，最多只允许 1 次 focused reread；而且这次 reread 必须带新的范围，并且仍处于 explain phase。",
+          "一旦进入 modify phase，不要再回头 reread 同一个文件；你应该直接 edit/write，或者结束。",
+          "像“先解释这个测试文件在测什么，再加两行注释”这种混合请求，推荐 phase 顺序是 explain -> modify -> finalize。",
           "如果你正在请求 toolCalls，assistantMessage 一般应省略；不要反复输出“正在读取文件”“准备修改文件”这类中间态废话。",
           "如果复用已有 task id，title 和 inputSummary 仍然必须保留非空字符串；补不齐的 task 项就不要输出。",
           "memory.value 必须是非空字符串；补不齐的 memory 项就不要输出。",
@@ -1071,7 +1204,7 @@ export function createMiniMaxHooks(options?: MiniMaxHooksOptions): LangGraphHook
         {
           sanitizer: (value) => sanitizeExecutorCandidate(value, state),
           repairHint:
-            "tasks 最多 6 项；每个 task 都必须有非空 title 和 inputSummary；如果只想更新已有 task，也必须保留这两个字段；补不齐的 task 项不要输出。memory 最多 6 项；每个 memory 都必须有非空 key 和 value；memory.scope 只能是 session/workspace/user，memory.source 只能是 user/assistant/system/tool/review。toolCalls 最多 4 项；toolCalls.name 只能是 list/view/grep/write/edit；toolCalls.input 必须是 JSON object。",
+            "executionPhase 只能是 explain/modify/finalize。tasks 最多 6 项；每个 task 都必须有非空 title 和 inputSummary；如果只想更新已有 task，也必须保留这两个字段；补不齐的 task 项不要输出。memory 最多 6 项；每个 memory 都必须有非空 key 和 value；memory.scope 只能是 session/workspace/user，memory.source 只能是 user/assistant/system/tool/review。toolCalls 最多 4 项；toolCalls.name 只能是 list/view/grep/write/edit；toolCalls.input 必须是 JSON object。",
         },
       ),
     reviewer: async (state, input) =>

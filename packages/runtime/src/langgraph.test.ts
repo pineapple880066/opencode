@@ -909,6 +909,282 @@ describe("AgentLangGraphRuntime", () => {
     }
   });
 
+  test("完整读取后允许 1 次 focused reread，第 3 次 reread 会被 budget guard 拦截，并继续推进 edit", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-tool-view-budget-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "browser.test.ts");
+      await writeFile(
+        targetPath,
+        [
+          "import assert from \"node:assert/strict\";",
+          "import { describe, test } from \"node:test\";",
+          "",
+          "describe(\"browser runtime\", () => {",
+          "  test(\"works\", () => {",
+          "    assert.equal(1, 1);",
+          "  });",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-22T11:05:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_view_path_guard",
+        path: tempRoot,
+        label: "view-path-guard",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_view_path_guard",
+        workspaceId: workspace.id,
+        title: "view path guard session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        hooks: {
+          goalFactory: async () => ({
+            title: "控制同一路径的 reread 预算",
+            description: "完整读取一次后，允许 1 次 focused reread，第 3 次再拦截。",
+            successCriteria: ["允许 1 次 focused reread", "第 3 次 reread 会被拦截", "后续仍能 edit"],
+          }),
+          planner: async () => ({
+            summary: "先完整读取，再做 1 次 focused reread，第 3 次 reread 被 budget guard 拦下，然后改用 edit。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_view",
+                title: "完整读取 browser.test.ts",
+                description: "先拿到完整文件内容。",
+                status: "todo",
+              },
+              {
+                id: "plan_step_reread",
+                title: "做 1 次 focused reread",
+                description: "只补充查看局部断言片段。",
+                status: "todo",
+              },
+              {
+                id: "plan_step_edit",
+                title: "加两行注释",
+                description: "在 import 顶部前插入两行说明注释。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const sawView = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=view"),
+            );
+            const sawFocusedReread = state.messages.some(
+              (message) =>
+                message.role === "tool" &&
+                message.content.includes("tool=view") &&
+                message.content.includes("lineRange=4-6"),
+            );
+            const sawBudgetGuard = state.messages.some(
+              (message) =>
+                message.role === "system" &&
+                message.content.includes("不满足 reread policy"),
+            );
+            const sawEdit = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=edit"),
+            );
+
+            if (!sawView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view",
+                    reasoning: "先完整读取文件。",
+                    input: {
+                      path: "browser.test.ts",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawFocusedReread) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_reread",
+                    reasoning: "完整读取后，补一小段断言上下文做精读。",
+                    input: {
+                      path: "browser.test.ts",
+                      startLine: 4,
+                      endLine: 6,
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawBudgetGuard) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_reread",
+                    reasoning: "错误地再做一次 focused reread，应该被预算 guard 拦下。",
+                    input: {
+                      path: "browser.test.ts",
+                      offset: 1,
+                      limit: 3,
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawEdit) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_edit",
+                    reasoning: "收到 budget guard 之后，直接 edit。",
+                    input: {
+                      path: "browser.test.ts",
+                      search: "import assert from \"node:assert/strict\";",
+                      replace:
+                        "// 这个测试文件主要覆盖 browser runtime 的导航和文档输出。\n// 这里额外补两行注释，验证 budgeted reread 之后的 edit 流程。\nimport assert from \"node:assert/strict\";",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已经先解释测试文件职责，再完成注释修改。",
+              tasks: [
+                {
+                  id: "plan_step_view",
+                  title: "完整读取 browser.test.ts",
+                  inputSummary: "先拿到完整文件内容。",
+                  status: "done",
+                },
+                {
+                  id: "plan_step_reread",
+                  title: "做 1 次 focused reread",
+                  inputSummary: "只补充查看局部断言片段。",
+                  outputSummary: "完整读取后允许 1 次 focused reread，第 3 次 reread 被 budget guard 拦下。",
+                  status: "done",
+                },
+                {
+                  id: "plan_step_edit",
+                  title: "加两行注释",
+                  inputSummary: "在 import 顶部前插入两行说明注释。",
+                  outputSummary: "focused reread 预算用尽后，直接完成 edit。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["完整读取后允许 1 次 focused reread，第 3 次 reread 被预算 guard 拦截，并成功完成 edit。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "budgeted reread policy 已阻止第 3 次读取",
+            openLoops: [],
+            nextActions: ["继续增强 mixed explain + edit 任务的执行策略"],
+            importantFacts: ["完整读取后允许 1 次 focused reread", "第 3 次 reread 会被 guard 拦下"],
+          }),
+        },
+      });
+
+      const result = await runtime.invoke({
+        sessionId: session.id,
+        userMessage: "先解释这个测试文件在测什么，然后再加两行注释说明",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /这个测试文件主要覆盖 browser runtime 的导航和文档输出/);
+      assert.match(finalContent, /budgeted reread 之后的 edit 流程/);
+      assert.equal(executorCallCount, 5);
+      assert.match(result.executionLog.join("\n"), /拦截了 1 次重复工具调用/);
+
+      const toolLogs = await store.toolInvocations.listBySession(session.id);
+      assert.equal(toolLogs.length, 3);
+      assert.equal(toolLogs[0]?.toolName, "view");
+      assert.equal(toolLogs[1]?.toolName, "view");
+      assert.equal(toolLogs[2]?.toolName, "edit");
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+                message.role === "system" &&
+                message.content.includes("不满足 reread policy"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "tool" &&
+            message.content.includes("tool=view") &&
+            message.content.includes("lineRange=4-6"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+                message.role === "assistant" &&
+                message.content.includes("已经先解释测试文件职责，再完成注释修改"),
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   test("失败的重复工具调用不会被误判成成功循环 guard", async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-tool-failed-guard-"));
 
@@ -1038,6 +1314,231 @@ describe("AgentLangGraphRuntime", () => {
       );
       assert.equal(
         messages.some((message) => message.role === "assistant" && message.content.includes("没有误触发 loop guard")),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("mixed explain + edit 请求里，explain phase 不能提前收尾，runtime 会强制继续 modify", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-mixed-explain-edit-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "browser.test.ts");
+      await writeFile(
+        targetPath,
+        [
+          "import assert from \"node:assert/strict\";",
+          "import { describe, test } from \"node:test\";",
+          "",
+          "describe(\"ide browser runtime\", () => {",
+          "  test(\"works\", () => {",
+          "    assert.equal(1, 1);",
+          "  });",
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-23T02:30:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_mixed_explain_edit",
+        path: tempRoot,
+        label: "mixed-explain-edit",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_mixed_explain_edit",
+        workspaceId: workspace.id,
+        title: "mixed explain edit session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        hooks: {
+          goalFactory: async () => ({
+            title: "先解释再修改测试文件",
+            description: "解释 browser.test.ts 在测什么，然后真的补两行注释。",
+            successCriteria: ["会解释测试职责", "会真实修改文件"],
+          }),
+          planner: async () => ({
+            summary: "先读文件拿上下文，再解释，再补注释。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_explain",
+                title: "解释 browser.test.ts",
+                description: "说明它在测 browser runtime 的导航和文档输出。",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_edit",
+                title: "补两行注释",
+                description: "在文件顶部插入说明注释。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const sawView = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=view"),
+            );
+            const sawPolicyNudge = state.messages.some(
+              (message) =>
+                message.role === "system" &&
+                message.content.includes("EXECUTION_POLICY: 用户请求同时包含解释和修改"),
+            );
+            const sawEdit = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=edit"),
+            );
+
+            if (!sawView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_explain",
+                    reasoning: "先读取测试文件拿上下文。",
+                    input: {
+                      path: "browser.test.ts",
+                      startLine: 1,
+                      endLine: 8,
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawPolicyNudge) {
+              return {
+                executionPhase: "explain",
+                assistantMessage:
+                  "browser.test.ts 主要在测 browser runtime 的导航参数解析、data-action 还原，以及最终 IDE 文档渲染。",
+                tasks: [
+                  {
+                    id: "plan_step_explain",
+                    title: "解释 browser.test.ts",
+                    inputSummary: "说明它在测 browser runtime 的导航和文档输出。",
+                    outputSummary: "已经完成测试职责解释。",
+                    status: "done",
+                  },
+                ],
+              };
+            }
+
+            if (!sawEdit) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_edit",
+                    reasoning: "解释完成后，继续落真实注释修改。",
+                    input: {
+                      path: "browser.test.ts",
+                      search: "import assert from \"node:assert/strict\";",
+                      replace:
+                        "// 这个测试文件主要覆盖 browser runtime 的导航和文档渲染。\n// 这里补两行注释，验证 mixed explain + edit 不会提前收尾。\nimport assert from \"node:assert/strict\";",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已经先解释测试内容，再补上两行注释。",
+              tasks: [
+                {
+                  id: "plan_step_edit",
+                  title: "补两行注释",
+                  inputSummary: "在文件顶部插入说明注释。",
+                  outputSummary: "已在解释完成后真实修改文件。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["解释已给出，文件也已经被真实修改。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "mixed explain + edit 已走完两阶段执行",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["runtime 不会在 explain phase 提前收尾"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage:
+          "我没看懂 browser.test.ts 在测试什么，先解释一下，然后再加两行注释说明。",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /这个测试文件主要覆盖 browser runtime 的导航和文档渲染/);
+      assert.match(finalContent, /mixed explain \+ edit 不会提前收尾/);
+      assert.equal(executorCallCount, 4);
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("EXECUTION_POLICY: 用户请求同时包含解释和修改"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "assistant"
+            && message.content.includes("主要在测 browser runtime 的导航参数解析"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "assistant" && message.content.includes("已经先解释测试内容，再补上两行注释"),
+        ),
         true,
       );
     } finally {

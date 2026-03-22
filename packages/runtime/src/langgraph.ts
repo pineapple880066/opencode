@@ -33,11 +33,14 @@ export interface LangGraphGoalDraft {
 }
 
 export interface LangGraphExecuteResult {
+  executionPhase?: LangGraphExecutionPhase;
   assistantMessage?: string;
   tasks?: SyncTasksInput["tasks"];
   memory?: Array<Omit<RecordMemoryInput, "sessionId" | "workspaceId">>;
   toolCalls?: LangGraphToolCall[];
 }
+
+export type LangGraphExecutionPhase = "explain" | "modify" | "finalize";
 
 export interface LangGraphToolCall {
   name: Extract<ToolName, "list" | "view" | "grep" | "write" | "edit">;
@@ -143,6 +146,179 @@ function buildToolCallKey(toolCall: LangGraphToolCall): string {
     taskId: toolCall.taskId ?? null,
     input: toolCall.input,
   });
+}
+
+// 这个辅助函数是这次“反复 view 同一个文件”问题里的一个关键点。
+// 之前 runtime 只按“整条 toolCall 是否完全相同”来判重。
+// 但模型会把同一路径的 view 稍微改一下参数，比如：
+// - 第一次 path=browser.test.ts
+// - 第二次 path=browser.test.ts + lineRange=1-70
+// 这样 buildToolCallKey 就变了，旧的 loop guard 也就拦不住。
+// 所以这里额外抽出“这次工具调用到底是在操作哪个路径”，
+// 后面 execute 阶段可以做更强的、按路径维度的防打转判断。
+function readToolCallPath(toolCall: LangGraphToolCall): string | undefined {
+  if (!isRecord(toolCall.input)) {
+    return undefined;
+  }
+
+  const directPath = toolCall.input.path;
+  if (typeof directPath === "string" && directPath.trim().length > 0) {
+    return directPath.trim();
+  }
+
+  const aliasedPath = toolCall.input.file_path ?? toolCall.input.filePath;
+  if (typeof aliasedPath === "string" && aliasedPath.trim().length > 0) {
+    return aliasedPath.trim();
+  }
+
+  return undefined;
+}
+
+// 这次 bug 还有一个细节：不是所有 view 都应该一律视作重复。
+// 如果模型明确给了 startLine/endLine 或 lineRange，说明它想做“局部读取”。
+// 所以我们先识别“这次 view 是否显式声明了范围”，
+// 后面只在“已经完整读取过同一路径，且现在又来一轮新的 view”时才强拦。
+// 这样可以避免把合理的局部阅读也一刀切掉。
+function hasExplicitViewRange(toolCall: LangGraphToolCall): boolean {
+  if (!isRecord(toolCall.input)) {
+    return false;
+  }
+
+  if (typeof toolCall.input.startLine === "number" || typeof toolCall.input.endLine === "number") {
+    return true;
+  }
+  if (typeof toolCall.input.start_line === "number" || typeof toolCall.input.end_line === "number") {
+    return true;
+  }
+
+  const lineRange = toolCall.input.lineRange ?? toolCall.input.line_range;
+  return typeof lineRange === "string" && lineRange.trim().length > 0;
+}
+
+function readExplicitViewRangeKey(toolCall: LangGraphToolCall): string | undefined {
+  if (!isRecord(toolCall.input)) {
+    return undefined;
+  }
+
+  const directStart =
+    typeof toolCall.input.startLine === "number"
+      ? toolCall.input.startLine
+      : typeof toolCall.input.start_line === "number"
+        ? toolCall.input.start_line
+        : undefined;
+  const directEnd =
+    typeof toolCall.input.endLine === "number"
+      ? toolCall.input.endLine
+      : typeof toolCall.input.end_line === "number"
+        ? toolCall.input.end_line
+        : undefined;
+
+  if (directStart !== undefined || directEnd !== undefined) {
+    return `${directStart ?? "?"}-${directEnd ?? "?"}`;
+  }
+
+  const lineRange = toolCall.input.lineRange ?? toolCall.input.line_range;
+  if (typeof lineRange === "string" && lineRange.trim().length > 0) {
+    return lineRange.trim();
+  }
+
+  const offset =
+    typeof toolCall.input.offset === "number"
+      ? toolCall.input.offset
+      : typeof toolCall.input.offset === "string"
+        ? Number(toolCall.input.offset)
+        : undefined;
+  const limit =
+    typeof toolCall.input.limit === "number"
+      ? toolCall.input.limit
+      : typeof toolCall.input.limit === "string"
+        ? Number(toolCall.input.limit)
+        : undefined;
+
+  if (Number.isFinite(offset) || Number.isFinite(limit)) {
+    return `offset=${Number.isFinite(offset) ? offset : "?"};limit=${Number.isFinite(limit) ? limit : "?"}`;
+  }
+
+  return undefined;
+}
+
+interface ViewReadBudgetState {
+  hasFullRead: boolean;
+  focusedRereads: number;
+  seenFocusedRanges: Set<string>;
+}
+
+function createViewReadBudgetState(): ViewReadBudgetState {
+  return {
+    hasFullRead: false,
+    focusedRereads: 0,
+    seenFocusedRanges: new Set<string>(),
+  };
+}
+
+function inferExecutionPhase(execution: LangGraphExecuteResult): LangGraphExecutionPhase {
+  if (execution.executionPhase) {
+    return execution.executionPhase;
+  }
+
+  const toolNames = new Set((execution.toolCalls ?? []).map((toolCall) => toolCall.name));
+  if (toolNames.has("edit") || toolNames.has("write")) {
+    return "modify";
+  }
+  if (toolNames.has("view") || toolNames.has("grep") || toolNames.has("list")) {
+    return "explain";
+  }
+
+  return "finalize";
+}
+
+function createViewBudgetGuardMessage(
+  toolCall: LangGraphToolCall,
+  path: string,
+  reason: string,
+): string {
+  return [
+    "LOOP_GUARD: 当前 view 请求不满足 reread policy。",
+    `tool=${toolCall.name}`,
+    `path=${path}`,
+    `input=${truncate(stableSerialize(toolCall.input), 1200)}`,
+    reason,
+    "请基于已有读取结果继续 edit/write，或者直接输出最终 assistantMessage。",
+  ].join("\n");
+}
+
+function looksLikeModificationRequest(userMessage: string | undefined): boolean {
+  if (!userMessage) {
+    return false;
+  }
+
+  return /(修改|编辑|改动|加注释|注释|写入|替换|重构|补上|comment|edit|write|patch|modify|change|update)/i.test(
+    userMessage,
+  );
+}
+
+function hasPendingModificationWork(state: AgentGraphState): boolean {
+  const taskSuggestsModify = state.tasks.some(
+    (task) =>
+      (task.status === "todo" || task.status === "in_progress" || task.status === "blocked")
+      && /(修改|编辑|加注释|写|替换|补|edit|write|comment|modify|update)/i.test(
+        `${task.title} ${task.inputSummary} ${task.outputSummary ?? ""}`,
+      ),
+  );
+
+  if (taskSuggestsModify) {
+    return true;
+  }
+
+  return Boolean(
+    state.currentPlan?.steps.some(
+      (step) =>
+        (step.status === "todo" || step.status === "in_progress" || step.status === "blocked")
+        && /(修改|编辑|加注释|写|替换|补|edit|write|comment|modify|update)/i.test(
+          `${step.title} ${step.description} ${step.evidence ?? ""}`,
+        ),
+    ),
+  );
 }
 
 function prepareToolInput(
@@ -407,8 +583,10 @@ export function createAgentLangGraph(
     let runtimeState: AgentGraphState = state.runtimeState;
     let executedToolCalls = 0;
     let duplicateToolCalls = 0;
+    let executedWriteLikeTool = false;
     let lastSuccessfulToolCallKey: string | undefined;
-    const maxToolRounds = 4;
+    const viewReadBudgets = new Map<string, ViewReadBudgetState>();
+    const maxToolRounds = 5;
     const maxToolCallsPerRound = 4;
 
     for (let round = 0; round < maxToolRounds; round += 1) {
@@ -426,14 +604,47 @@ export function createAgentLangGraph(
       }
 
       const toolCalls = (execution.toolCalls ?? []).slice(0, maxToolCallsPerRound);
+      const executionPhase = inferExecutionPhase(execution);
+      const shouldForceModifyContinuation =
+        toolCalls.length === 0
+        && executionPhase === "explain"
+        && executedToolCalls > 0
+        && !executedWriteLikeTool
+        && looksLikeModificationRequest(state.userMessage)
+        && hasPendingModificationWork(runtimeState)
+        && round < maxToolRounds - 1;
 
-      // 有 toolCalls 的轮次属于内部工具循环，中间态不直接当成用户可见 assistant 消息。
+      // mixed explain + edit 请求里，如果模型先完成了解释、但还没真正落修改，
+      // 这里不要直接把 execute 收尾。
+      // 否则用户会看到一段解释文字，却发现文件根本没改，体验上就像“agent 看懂了，但不继续动手”。
+      //
+      // 当前策略是：
+      // - 用户请求里带修改意图
+      // - 本轮 phase 仍是 explain
+      // - 当前 invoke 已经用过工具，但还没有任何 edit/write 成功
+      // - plan/task 里还存在待做的修改工作
+      //
+      // 那就把解释消息先落库，再追加一条 system nudge，强制下一轮进入 modify phase。
       if (execution.assistantMessage && toolCalls.length === 0) {
         await service.appendMessage({
           sessionId: state.sessionId,
           role: "assistant",
           content: execution.assistantMessage,
         });
+      }
+
+      if (shouldForceModifyContinuation) {
+        await service.appendMessage({
+          sessionId: state.sessionId,
+          role: "system",
+          content: [
+            "EXECUTION_POLICY: 用户请求同时包含解释和修改。",
+            "当前 explain phase 已经产出了说明，但文件还没有真实改动。",
+            "下一轮必须切到 modify phase，直接发起 edit/write，不能在 explain phase 收尾。",
+          ].join("\n"),
+        });
+        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+        continue;
       }
 
       if (execution.tasks?.length) {
@@ -466,6 +677,15 @@ export function createAgentLangGraph(
 
       for (const toolCall of toolCalls) {
         const toolCallKey = buildToolCallKey(toolCall);
+        const toolPath = readToolCallPath(toolCall);
+        const explicitViewRangeKey = toolCall.name === "view" ? readExplicitViewRangeKey(toolCall) : undefined;
+        const viewBudget =
+          toolCall.name === "view" && toolPath
+            ? (viewReadBudgets.get(toolPath) ?? createViewReadBudgetState())
+            : undefined;
+
+        // 第一层 loop guard：完全相同的工具调用刚刚已经成功执行过。
+        // 这个规则能拦住最直接的“同一个 tool + 同一个 input 原样重放”。
         if (toolCallKey === lastSuccessfulToolCallKey) {
           duplicateToolCalls += 1;
           await service.appendMessage({
@@ -474,6 +694,50 @@ export function createAgentLangGraph(
             content: createDuplicateToolLoopGuardMessage(toolCall),
           });
           continue;
+        }
+
+        // 第二层 loop guard：显式 reread budget。
+        //
+        // 旧版本的问题是：
+        // - “完整读取过一次同一路径”之后，任何新的 view 都被硬拦
+        // - 这样虽然能止血，但会误伤合理的二次精读
+        //
+        // 现在的策略改成：
+        // - 第一次完整读取允许
+        // - 完整读取之后，允许 1 次 focused reread
+        // - focused reread 必须带新的范围，并且当前 phase 仍是 explain
+        // - 进入 modify/finalize 后，不再允许回头 reread
+        // - 第 3 次读取同一路径时再拦截
+        //
+        // 这层更像“tool-use control loop”而不是简单去重。
+        if (toolCall.name === "view" && toolPath && viewBudget) {
+          if (viewBudget.hasFullRead) {
+            let budgetViolationReason: string | undefined;
+
+            if (!explicitViewRangeKey) {
+              budgetViolationReason =
+                "当前文件已经完整读取过一次。full reread 不再允许；如果证据已经足够，请直接 edit/write 或总结。";
+            } else if (viewBudget.focusedRereads >= 1) {
+              budgetViolationReason =
+                "当前文件已经用掉 1 次 focused reread 预算。第 3 次再读同一路径会被拦截。";
+            } else if (viewBudget.seenFocusedRanges.has(explicitViewRangeKey)) {
+              budgetViolationReason =
+                "当前 focused reread 没有带来新的范围信息；重复精读同一片段不会增加信息增益。";
+            } else if (executionPhase !== "explain") {
+              budgetViolationReason =
+                `当前 executor phase=${executionPhase}。focused reread 只允许发生在 explain phase，modify/finalize 阶段应直接推进 edit/write 或总结。`;
+            }
+
+            if (budgetViolationReason) {
+              duplicateToolCalls += 1;
+              await service.appendMessage({
+                sessionId: state.sessionId,
+                role: "system",
+                content: createViewBudgetGuardMessage(toolCall, toolPath, budgetViolationReason),
+              });
+              continue;
+            }
+          }
         }
 
         const result = await toolExecutor.execute({
@@ -486,6 +750,22 @@ export function createAgentLangGraph(
         executedThisRound += 1;
         if (result.ok) {
           lastSuccessfulToolCallKey = toolCallKey;
+          if (toolCall.name === "edit" || toolCall.name === "write") {
+            executedWriteLikeTool = true;
+          }
+
+          if (toolCall.name === "view" && toolPath && viewBudget) {
+            if (hasExplicitViewRange(toolCall) && explicitViewRangeKey) {
+              viewBudget.seenFocusedRanges.add(explicitViewRangeKey);
+              if (viewBudget.hasFullRead) {
+                viewBudget.focusedRereads += 1;
+              }
+            } else {
+              viewBudget.hasFullRead = true;
+            }
+
+            viewReadBudgets.set(toolPath, viewBudget);
+          }
         }
 
         await service.appendMessage({

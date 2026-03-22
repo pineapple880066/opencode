@@ -1,3 +1,5 @@
+// 本测试文件用于验证同级目录 browser.ts 模块的功能
+// 测试范围：URL 参数序列化/反序列化、data-action 数据集解析、导航状态约简
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";

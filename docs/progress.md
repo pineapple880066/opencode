@@ -22,11 +22,13 @@
 - 当前浏览器工作台已经把左侧 `agent` 区和右下 `terminal` 区做成可开关面板，而且开关状态已经进入 server-driven 导航协议；这意味着刷新页面、切换 session、提交 prompt / 保存文件 / 运行命令之后，工作区布局不会乱跳
 - LangGraph 的 `execute` 节点已经接入最小真实工具循环：模型可以返回 `toolCalls`，runtime 会真实执行 `list / view / grep / write / edit`，再把工具结果回写到消息和 tool invocation 日志里
 - `execute` 节点针对“重复读取同一个文件、却不继续 edit”的打转问题又加了一层 runtime 约束：最近工具调用摘要会喂回 executor，连续重复的相同工具调用会被 loop guard 拦截，不再无限重复 `view`
+- 这条执行链这轮又从“硬 guard”推进到了“budgeted reread policy”：`view` 合同现在显式支持 `startLine/endLine` 和 `offset/limit`，MiniMax prompt 也会输出 `executionPhase`；runtime 不再粗暴地禁止同一路径二次读取，而是改成“首次完整读取允许、之后允许 1 次 focused reread、第 3 次再拦”，同时要求 reread 必须带新范围并且仍处于 `explain` phase
 - 第一批内建文件工具开始兼容更常见的外部 agent 参数风格：`file_path`、`old_string/oldString`、`new_string/newString`、`replace_all`
 - planning mode 工具拦截、第一批真实工具、subagent delegation / child session 生命周期也已经进入执行层，而不只是 schema/合同层
 - `MiniMax` 的 LangGraph hooks 适配层已经写好，包含配置读取、结构化 JSON 解析和 smoke 脚本
 - `MiniMax` 适配层已经补了枚举归一化，对 `pending / completed / 进行中 / research / model` 这类常见别名有更强容错
 - `MiniMax` 适配层进一步补成了三层防线：prompt 约束、本地 sanitizer 归一化/裁剪、以及一次受限的 JSON repair 重试，不再把结构化输出完全寄托在模型自觉上
+- `MiniMax` 适配层这轮又补了一层更底的语法修复：以前只会修 Zod 校验失败，现在连 `JSON.parse` 级别的脏 JSON 也会先走一次 syntax repair，再进入 schema 校验，避免 planner/executor 因为丢一个逗号就直接 500
 - `MiniMax` executor 的本地兜底继续加强了：如果模型只返回 `task id + status`，会优先从当前 runtime state 里的旧 task / plan step 补全 `title` 和 `inputSummary`；补不齐的脏 task 和空 memory 项会被直接丢弃
 - `2026-03-21` 已经在真实 `MiniMax` API key + 本地 `MySQL/Redis` 基础设施下跑通 `pnpm smoke:minimax`，拿到第一条外部模型链路证据
 - `packages/evals/src/minimax-smoke.ts` 已支持 `--session` 和 `--latest`，可以复用已有 session 继续追问，而不是每次都新建会话
@@ -103,9 +105,11 @@
 - `apps/ide-web/src/dev-server.ts` 已经把 prompt 提交接到 `runtime.langGraph.invoke()`，并支持无 session 时自动创建 session
 - `packages/runtime/src/langgraph.ts` 已经把 executor 的结构化 `toolCalls` 接进 `RuntimeToolExecutor`，不再只是把“正在读取文件”写成一条消息
 - `packages/runtime/src/langgraph.ts` 现在会把工具输出回写成 `tool` message，并同步留下 `tool_invocations`，这样 replay / activity 才真的有执行证据
-- `packages/runtime/src/langgraph.ts` 现在还会拦截连续重复的相同工具调用，并通过 `LOOP_GUARD` system message 把约束显式反馈给下一轮 executor
+- `packages/runtime/src/langgraph.ts` 现在会同时做两层控制：一层拦截完全相同的重复工具调用，另一层按路径维护 `view` 的 reread budget，并通过 `LOOP_GUARD` system message 把约束显式反馈给下一轮 executor
 - loop guard 现在只针对“成功的重复工具调用”生效，失败的工具调用会把错误信息留给下一轮修参，不会被误判成成功循环
-- `apps/ide-web/src/minimax.ts` 现在会把最近的工具调用摘要带进 `runtimeState` digest，并显式要求 executor 不要重复相同工具、不要在工具轮次里反复输出“正在读取文件”这类中间态废话
+- `apps/ide-web/src/minimax.ts` 现在会把最近的工具调用摘要带进 `runtimeState` digest，并显式要求 executor 输出 `executionPhase`，把 mixed explain + edit 任务拆成 `explain -> modify -> finalize` 这种更清晰的执行相位
+- `packages/runtime/src/langgraph.ts` 这轮又补了一层 mixed explain + edit 续跑策略：如果模型在 `explain` phase 先给了解释、但还没真实执行 `edit/write`，runtime 不会直接收尾，而是追加一条 `EXECUTION_POLICY` system message，强制下一轮切到 `modify` phase 继续落改动
+- `apps/ide-web/src/server.ts` 和 `apps/ide-web/src/browser.ts` 也补了更稳的 API 错误边界：invoke/save-file/terminal-run 这类 IDE API 现在会返回结构化 JSON error，浏览器端不再盲目 `response.json()`，真实错误不会再被二次 `SyntaxError` 掩盖成一句模糊的“Agent 调用失败”
 - 已有 subagent delegation / absorb / replay / cleanup 的局部测试
 
 还没有：
@@ -161,7 +165,7 @@
 - `packages/evals/src/minimax-smoke.ts` 已经提供真实模型 smoke 入口
 - `packages/db/src/env.ts` 已经把工作区级配置自动加载收敛成公共 helper
 - `2026-03-21` 已经用真实 `MiniMax` API key 跑通一次 smoke，拿到了 goal / plan / execute / review / summarize 的外部模型证据
-- 当前自动化验证已经到 `43` 个测试，全绿
+- 当前自动化验证已经到 `49` 个测试，全绿
 - `MiniMax` 适配层已经补上“超限数组自动裁剪”和“校验失败后 repair 重试”的回归测试
 - `MiniMax` 适配层已经补上“executor 从现有 state 补全缺失 task 字段”和“smoke 复用 session 参数解析”的回归测试
 - IDE 工作台已经补上“shell 渲染文件编辑表单”“浏览器保存文件”“服务端 save-file 边界”“无 session 时也能展示 workspace 文件预览”的测试
