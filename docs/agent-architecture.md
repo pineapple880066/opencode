@@ -248,11 +248,25 @@ Runtime 要偏保守。如果它不确定 goal 是否完成，就必须显式报
 
 ### Phase 3：IDE 外壳
 
-- session 侧边栏
+- 类 opencode 的单主工作区 workbench：把 session/context 收进顶部或次级区域，把主舞台留给 agent、编辑器和终端
+- 消息面板和 prompt 输入框
+- session strip / session 列表
+- workspace 文件列表、编辑器和保存链路
+- 终端面板
 - plan 面板
+- goal 面板
+- activity log 面板
 - run log 面板
 - 文件树和编辑器集成
 - subagent 可视化
+
+第一版 Web IDE 至少要做到：
+
+- 能在同一 session 里连续提交 prompt，而不是每次都重新开会话
+- 能直接浏览当前 workspace 的文件，并至少可以编辑和保存文本内容
+- 能在当前 workspace 内执行命令，并查看最近的输出
+- 能直接看到当前 active goal、current plan、recent messages、activity log
+- 能从主交互区切到 replay / delegation / inspector，而不是只剩一个检查器页面
 
 ## 架构层面的危险信号
 

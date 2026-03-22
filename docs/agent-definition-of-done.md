@@ -175,7 +175,13 @@
 必须满足：
 
 - session 列表可用
+- 消息面板和 prompt 输入框可用，并且能在同一 session 上继续推进
+- workspace 文件列表和文件内容不能只停在只读预览；至少要有一个最小可用的编辑器并能保存回工作区
+- 主工作区不能只是 tab 式消息页；至少要有一个单主工作区 workbench，把 agent 对话、文件编辑和终端面板收进同一主交互面
+- 终端面板至少要最小可用，能在当前 workspace 内执行命令并查看最近输出历史
 - active goal 和 plan 可见
+- activity log 可见，至少能看到 message / checkpoint / tool invocation 的执行痕迹
 - subagent 活动可检查
 - run log 可检查
+- 界面结构必须像一个真正的 agent IDE，而不只是 session 概览页或 inspector 壳层
 - 未完成工作会被明确暴露出来
