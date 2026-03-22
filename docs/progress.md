@@ -19,6 +19,7 @@
 - 当前浏览器工作台已经支持浏览当前 workspace 文件列表，并在主工作区里直接编辑、保存文本文件，不再只有会话记录和只读预览
 - 当前浏览器工作台已经补上最小可用的终端命令面板：可以在当前 workspace 内执行命令，并把最近的 stdout / stderr 历史保留在工作区里
 - 当前浏览器工作台这轮又做了一次 `UI 稳定性修复`：workbench 改成固定区域 + 内部滚动，避免 workspace explorer 把整页撑长，也避免编辑区和终端区继续互相重叠
+- 当前浏览器工作台已经把左侧 `agent` 区和右下 `terminal` 区做成可开关面板，而且开关状态已经进入 server-driven 导航协议；这意味着刷新页面、切换 session、提交 prompt / 保存文件 / 运行命令之后，工作区布局不会乱跳
 - LangGraph 的 `execute` 节点已经接入最小真实工具循环：模型可以返回 `toolCalls`，runtime 会真实执行 `list / view / grep / write / edit`，再把工具结果回写到消息和 tool invocation 日志里
 - `execute` 节点针对“重复读取同一个文件、却不继续 edit”的打转问题又加了一层 runtime 约束：最近工具调用摘要会喂回 executor，连续重复的相同工具调用会被 loop guard 拦截，不再无限重复 `view`
 - 第一批内建文件工具开始兼容更常见的外部 agent 参数风格：`file_path`、`old_string/oldString`、`new_string/newString`、`replace_all`
@@ -97,6 +98,7 @@
 - `apps/ide-web/src/shell.ts` 现在进一步把左/右侧边栏压缩成顶部信息条和横向 session strip，避免无效信息占用主编辑区宽度
 - `apps/ide-web/src/shell.ts` 现在把 workspace explorer、editor、terminal 都收成固定区域和独立滚动容器，当前 workbench 至少具备 agent IDE 的基础“聊、看、改、跑”能力
 - `apps/ide-web/src/browser.ts` 已经把点击导航、prompt 提交、文件保存和终端命令提交都接进浏览器运行时，页面不再只是只读壳层
+- `apps/ide-web/src/browser.ts / server.ts / shell.ts` 现在会共同维护 pane visibility：`conversationPane / terminalPane` 会通过 URL navigation、浏览器动作 reducer 和 POST 边界一起传递，保证工作区布局状态可恢复
 - `apps/ide-web/src/server.ts` 已经提供最小 HTTP 边界，既支持浏览器取 shell HTML / JSON state，也支持 POST prompt / save-file / terminal-run
 - `apps/ide-web/src/dev-server.ts` 已经把 prompt 提交接到 `runtime.langGraph.invoke()`，并支持无 session 时自动创建 session
 - `packages/runtime/src/langgraph.ts` 已经把 executor 的结构化 `toolCalls` 接进 `RuntimeToolExecutor`，不再只是把“正在读取文件”写成一条消息

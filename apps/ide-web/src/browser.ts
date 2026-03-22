@@ -57,6 +57,12 @@ export function serializeIdeShellNavigation(
   if (input.focusedPanel) {
     params.set("focusedPanel", input.focusedPanel);
   }
+  if (input.conversationPane === "collapsed") {
+    params.set("conversationPane", "collapsed");
+  }
+  if (input.terminalPane === "collapsed") {
+    params.set("terminalPane", "collapsed");
+  }
 
   return params;
 }
@@ -84,6 +90,8 @@ export function parseIdeShellNavigation(
     selectedTimelineIndex:
       selectedTimelineIndexRaw !== null ? Number(selectedTimelineIndexRaw) : undefined,
     focusedPanel: normalizeIdePanelId(focusedPanelRaw),
+    conversationPane: params.get("conversationPane") === "collapsed" ? "collapsed" : "open",
+    terminalPane: params.get("terminalPane") === "collapsed" ? "collapsed" : "open",
   };
 }
 
@@ -115,6 +123,10 @@ export function parseIdeShellActionDataset(
       return dataset.index !== undefined
         ? { type: "inspect-timeline", index: Number(dataset.index) }
         : null;
+    case "toggle-conversation-pane":
+      return { type: "toggle-conversation-pane" };
+    case "toggle-terminal-pane":
+      return { type: "toggle-terminal-pane" };
     default:
       return null;
   }
@@ -175,6 +187,12 @@ function buildBrowserRuntimeScript(): string {
     if (input.focusedPanel) {
       params.set("focusedPanel", input.focusedPanel);
     }
+    if (input.conversationPane === "collapsed") {
+      params.set("conversationPane", "collapsed");
+    }
+    if (input.terminalPane === "collapsed") {
+      params.set("terminalPane", "collapsed");
+    }
 
     return params.toString();
   }
@@ -217,6 +235,10 @@ function buildBrowserRuntimeScript(): string {
         return target.dataset.index !== undefined
           ? { type: "inspect-timeline", index: Number(target.dataset.index) }
           : null;
+      case "toggle-conversation-pane":
+        return { type: "toggle-conversation-pane" };
+      case "toggle-terminal-pane":
+        return { type: "toggle-terminal-pane" };
       default:
         return null;
     }
@@ -233,6 +255,8 @@ function buildBrowserRuntimeScript(): string {
           selectedParentTaskId: state.selectedParentTaskId,
           selectedTimelineIndex: state.selectedTimelineIndex,
           focusedPanel: action.panel,
+          conversationPane: state.conversationPane,
+          terminalPane: state.terminalPane,
         };
       case "select-session":
         return {
@@ -240,6 +264,8 @@ function buildBrowserRuntimeScript(): string {
           selectedSessionId: action.sessionId,
           selectedFilePath: state.selectedFilePath,
           focusedPanel: "workbench",
+          conversationPane: state.conversationPane,
+          terminalPane: state.terminalPane,
         };
       case "open-file":
         return {
@@ -249,6 +275,8 @@ function buildBrowserRuntimeScript(): string {
           selectedRunId: state.selectedRunId,
           selectedParentTaskId: state.selectedParentTaskId,
           focusedPanel: "workbench",
+          conversationPane: state.conversationPane,
+          terminalPane: state.terminalPane,
         };
       case "open-replay":
         return {
@@ -258,6 +286,8 @@ function buildBrowserRuntimeScript(): string {
           selectedRunId: action.runId,
           selectedParentTaskId: state.selectedParentTaskId,
           focusedPanel: "subagent-replay",
+          conversationPane: state.conversationPane,
+          terminalPane: state.terminalPane,
         };
       case "open-parent-task":
         return {
@@ -267,6 +297,8 @@ function buildBrowserRuntimeScript(): string {
           selectedRunId: state.selectedRunId,
           selectedParentTaskId: action.parentTaskId,
           focusedPanel: "parent-task-delegation",
+          conversationPane: state.conversationPane,
+          terminalPane: state.terminalPane,
         };
       case "inspect-timeline":
         return {
@@ -277,6 +309,32 @@ function buildBrowserRuntimeScript(): string {
           selectedParentTaskId: state.selectedParentTaskId,
           selectedTimelineIndex: action.index,
           focusedPanel: "inspector",
+          conversationPane: state.conversationPane,
+          terminalPane: state.terminalPane,
+        };
+      case "toggle-conversation-pane":
+        return {
+          workspacePath: state.workspacePath,
+          selectedSessionId: state.selectedSessionId,
+          selectedFilePath: state.selectedFilePath,
+          selectedRunId: state.selectedRunId,
+          selectedParentTaskId: state.selectedParentTaskId,
+          selectedTimelineIndex: state.selectedTimelineIndex,
+          focusedPanel: state.focusedPanel,
+          conversationPane: state.conversationPane === "open" ? "collapsed" : "open",
+          terminalPane: state.terminalPane,
+        };
+      case "toggle-terminal-pane":
+        return {
+          workspacePath: state.workspacePath,
+          selectedSessionId: state.selectedSessionId,
+          selectedFilePath: state.selectedFilePath,
+          selectedRunId: state.selectedRunId,
+          selectedParentTaskId: state.selectedParentTaskId,
+          selectedTimelineIndex: state.selectedTimelineIndex,
+          focusedPanel: state.focusedPanel,
+          conversationPane: state.conversationPane,
+          terminalPane: state.terminalPane === "open" ? "collapsed" : "open",
         };
       default:
         return readJsonScript(navigationScriptId);
@@ -313,6 +371,8 @@ function buildBrowserRuntimeScript(): string {
     const workspacePath = String(formData.get("workspacePath") || "").trim();
     const sessionId = String(formData.get("sessionId") || "").trim();
     const selectedFilePath = String(formData.get("selectedFilePath") || "").trim();
+    const conversationPane = String(formData.get("conversationPane") || "").trim();
+    const terminalPane = String(formData.get("terminalPane") || "").trim();
 
     if (!prompt) {
       window.alert("请输入要让 agent 执行的 prompt。");
@@ -339,6 +399,8 @@ function buildBrowserRuntimeScript(): string {
           workspacePath,
           sessionId: sessionId || undefined,
           selectedFilePath: selectedFilePath || undefined,
+          conversationPane: conversationPane === "collapsed" ? "collapsed" : "open",
+          terminalPane: terminalPane === "collapsed" ? "collapsed" : "open",
           prompt,
         }),
       });
@@ -363,6 +425,8 @@ function buildBrowserRuntimeScript(): string {
     const sessionId = String(formData.get("sessionId") || "").trim();
     const filePath = String(formData.get("filePath") || "").trim();
     const content = String(formData.get("content") || "");
+    const conversationPane = String(formData.get("conversationPane") || "").trim();
+    const terminalPane = String(formData.get("terminalPane") || "").trim();
 
     if (!workspacePath) {
       window.alert("当前缺少 workspacePath，无法保存文件。");
@@ -390,6 +454,8 @@ function buildBrowserRuntimeScript(): string {
           sessionId: sessionId || undefined,
           filePath,
           content,
+          conversationPane: conversationPane === "collapsed" ? "collapsed" : "open",
+          terminalPane: terminalPane === "collapsed" ? "collapsed" : "open",
         }),
       });
       const payload = await response.json();
@@ -413,6 +479,8 @@ function buildBrowserRuntimeScript(): string {
     const sessionId = String(formData.get("sessionId") || "").trim();
     const selectedFilePath = String(formData.get("selectedFilePath") || "").trim();
     const command = String(formData.get("command") || "").trim();
+    const conversationPane = String(formData.get("conversationPane") || "").trim();
+    const terminalPane = String(formData.get("terminalPane") || "").trim();
 
     if (!workspacePath) {
       window.alert("当前缺少 workspacePath，无法执行命令。");
@@ -439,6 +507,8 @@ function buildBrowserRuntimeScript(): string {
           workspacePath,
           sessionId: sessionId || undefined,
           selectedFilePath: selectedFilePath || undefined,
+          conversationPane: conversationPane === "collapsed" ? "collapsed" : "open",
+          terminalPane: terminalPane === "collapsed" ? "collapsed" : "open",
           command,
         }),
       });

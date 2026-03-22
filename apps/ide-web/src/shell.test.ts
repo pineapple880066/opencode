@@ -68,9 +68,54 @@ describe("ide shell", () => {
     assert.match(html, /main-panel is-visible/);
     assert.match(html, /workbench-header/);
     assert.match(html, /Workspace Command Runner/);
+    assert.match(html, /data-action="toggle-conversation-pane"/);
+    assert.match(html, /data-action="toggle-terminal-pane"/);
     assert.doesNotMatch(html, /Session Context/);
     assert.doesNotMatch(html, /<aside class="sidebar">/);
     assert.match(html, /帮我追踪 delegation 的执行情况/);
+  });
+
+  test("会把左侧 agent 区和终端区的开关状态保存在导航协议里", async () => {
+    const service = await seedIdeShellService();
+    const initial = await buildIdeShellState(service, {
+      workspacePath: "/tmp/project",
+      conversationPane: "open",
+      terminalPane: "open",
+    });
+
+    const collapsedConversation = reduceIdeShellNavigation(initial, {
+      type: "toggle-conversation-pane",
+    });
+    assert.equal(collapsedConversation.conversationPane, "collapsed");
+    assert.equal(collapsedConversation.terminalPane, "open");
+
+    const collapsedTerminal = reduceIdeShellNavigation(initial, {
+      type: "toggle-terminal-pane",
+    });
+    assert.equal(collapsedTerminal.conversationPane, "open");
+    assert.equal(collapsedTerminal.terminalPane, "collapsed");
+
+    const collapsedShell = await buildIdeShellState(service, {
+      workspacePath: "/tmp/project",
+      conversationPane: "collapsed",
+      terminalPane: "collapsed",
+    });
+    const html = renderIdeShellDocument(collapsedShell);
+
+    assert.match(html, /workbench-panel is-conversation-collapsed is-terminal-collapsed/);
+    assert.match(html, /Agent 已折叠/);
+    assert.match(html, /Show Agent/);
+    assert.match(html, /Show Terminal/);
+
+    const openShell = await buildIdeShellState(service, {
+      workspacePath: "/tmp/project",
+      conversationPane: "open",
+      terminalPane: "open",
+    });
+    const openHtml = renderIdeShellDocument(openShell);
+
+    assert.match(openHtml, /name="conversationPane" value="open"/);
+    assert.match(openHtml, /name="terminalPane" value="open"/);
   });
 
   test("当选中文件时，会渲染可保存的编辑器表单", async () => {

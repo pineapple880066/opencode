@@ -32,6 +32,8 @@ export interface IdeShellInvokeRequest {
   prompt: string;
   sessionId?: string;
   selectedFilePath?: string;
+  conversationPane?: "open" | "collapsed";
+  terminalPane?: "open" | "collapsed";
 }
 
 export interface IdeShellInvokeResult {
@@ -43,6 +45,8 @@ export interface IdeShellSaveFileRequest {
   filePath: string;
   content: string;
   sessionId?: string;
+  conversationPane?: "open" | "collapsed";
+  terminalPane?: "open" | "collapsed";
 }
 
 export interface IdeShellSaveFileResult {
@@ -55,6 +59,8 @@ export interface IdeShellTerminalRunRequest {
   command: string;
   sessionId?: string;
   selectedFilePath?: string;
+  conversationPane?: "open" | "collapsed";
+  terminalPane?: "open" | "collapsed";
 }
 
 export interface IdeShellTerminalRunResult {
@@ -193,6 +199,8 @@ export function createIdeShellRequestHandler(
           filePath,
           content: input.content,
           sessionId: input.sessionId?.trim() || undefined,
+          conversationPane: input.conversationPane === "collapsed" ? "collapsed" : "open",
+          terminalPane: input.terminalPane === "collapsed" ? "collapsed" : "open",
         });
 
         writeResponse(
@@ -206,6 +214,8 @@ export function createIdeShellRequestHandler(
               selectedSessionId: saveResult.sessionId ?? (input.sessionId?.trim() || undefined),
               selectedFilePath: saveResult.filePath,
               focusedPanel: "workbench",
+              conversationPane: input.conversationPane === "collapsed" ? "collapsed" : "open",
+              terminalPane: input.terminalPane === "collapsed" ? "collapsed" : "open",
             } satisfies IdeShellNavigationInput,
           }),
           request.method,
@@ -255,6 +265,8 @@ export function createIdeShellRequestHandler(
           command,
           sessionId: input.sessionId?.trim() || undefined,
           selectedFilePath: input.selectedFilePath?.trim() || undefined,
+          conversationPane: input.conversationPane === "collapsed" ? "collapsed" : "open",
+          terminalPane: input.terminalPane === "collapsed" ? "collapsed" : "open",
         });
 
         writeResponse(
@@ -267,6 +279,8 @@ export function createIdeShellRequestHandler(
               selectedSessionId: terminalResult.sessionId ?? (input.sessionId?.trim() || undefined),
               selectedFilePath: terminalResult.selectedFilePath ?? (input.selectedFilePath?.trim() || undefined),
               focusedPanel: "workbench",
+              conversationPane: input.conversationPane === "collapsed" ? "collapsed" : "open",
+              terminalPane: input.terminalPane === "collapsed" ? "collapsed" : "open",
             } satisfies IdeShellNavigationInput,
           }),
           request.method,
@@ -316,6 +330,8 @@ export function createIdeShellRequestHandler(
           prompt,
           sessionId: input.sessionId?.trim() || undefined,
           selectedFilePath: input.selectedFilePath?.trim() || undefined,
+          conversationPane: input.conversationPane === "collapsed" ? "collapsed" : "open",
+          terminalPane: input.terminalPane === "collapsed" ? "collapsed" : "open",
         });
 
         writeResponse(
@@ -329,6 +345,8 @@ export function createIdeShellRequestHandler(
               selectedSessionId: invokeResult.sessionId,
               selectedFilePath: input.selectedFilePath?.trim() || undefined,
               focusedPanel: "workbench",
+              conversationPane: input.conversationPane === "collapsed" ? "collapsed" : "open",
+              terminalPane: input.terminalPane === "collapsed" ? "collapsed" : "open",
             } satisfies IdeShellNavigationInput,
           }),
           request.method,

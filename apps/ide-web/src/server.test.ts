@@ -5,7 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
 
-import { createIdeShellServer } from "./server.js";
+import {
+  createIdeShellServer,
+  type IdeShellInvokeRequest,
+  type IdeShellSaveFileRequest,
+  type IdeShellTerminalRunRequest,
+} from "./server.js";
 import { seedIdeShellService } from "./testing.js";
 
 describe("ide shell server", () => {
@@ -81,7 +86,7 @@ describe("ide shell server", () => {
 
   test("会接收 prompt 提交，并返回下一次导航目标", async () => {
     const service = await seedIdeShellService();
-    let captured: { workspacePath: string; sessionId?: string; prompt: string } | undefined;
+    let captured: IdeShellInvokeRequest | undefined;
     const server = createIdeShellServer(service, {
       defaultWorkspacePath: "/tmp/project",
       invoke: async (input) => {
@@ -110,6 +115,8 @@ describe("ide shell server", () => {
           workspacePath: "/tmp/project",
           sessionId: "session_parent",
           prompt: "继续追踪当前 delegation",
+          conversationPane: "collapsed",
+          terminalPane: "open",
         }),
       });
       const payload = (await response.json()) as {
@@ -118,6 +125,8 @@ describe("ide shell server", () => {
           workspacePath: string;
           selectedSessionId: string;
           focusedPanel: string;
+          conversationPane: "open" | "collapsed";
+          terminalPane: "open" | "collapsed";
         };
       };
 
@@ -127,11 +136,15 @@ describe("ide shell server", () => {
         sessionId: "session_parent",
         prompt: "继续追踪当前 delegation",
         selectedFilePath: undefined,
+        conversationPane: "collapsed",
+        terminalPane: "open",
       });
       assert.equal(payload.sessionId, "session_parent");
       assert.equal(payload.navigation.workspacePath, "/tmp/project");
       assert.equal(payload.navigation.selectedSessionId, "session_parent");
       assert.equal(payload.navigation.focusedPanel, "workbench");
+      assert.equal(payload.navigation.conversationPane, "collapsed");
+      assert.equal(payload.navigation.terminalPane, "open");
     } finally {
       server.close();
       await once(server, "close");
@@ -141,9 +154,7 @@ describe("ide shell server", () => {
   test("会接收文件保存请求，并返回 files 面板导航", async () => {
     const service = await seedIdeShellService();
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-server-"));
-    let captured:
-      | { workspacePath: string; sessionId?: string; filePath: string; content: string }
-      | undefined;
+    let captured: IdeShellSaveFileRequest | undefined;
     const server = createIdeShellServer(service, {
       defaultWorkspacePath: tempRoot,
       saveFile: async (input) => {
@@ -174,6 +185,8 @@ describe("ide shell server", () => {
           sessionId: "session_parent",
           filePath: "notes.md",
           content: "# updated\n",
+          conversationPane: "open",
+          terminalPane: "collapsed",
         }),
       });
       const payload = (await response.json()) as {
@@ -183,6 +196,8 @@ describe("ide shell server", () => {
           selectedSessionId?: string;
           selectedFilePath?: string;
           focusedPanel: string;
+          conversationPane: "open" | "collapsed";
+          terminalPane: "open" | "collapsed";
         };
       };
 
@@ -192,12 +207,16 @@ describe("ide shell server", () => {
         sessionId: "session_parent",
         filePath: "notes.md",
         content: "# updated\n",
+        conversationPane: "open",
+        terminalPane: "collapsed",
       });
       assert.equal(payload.filePath, "notes.md");
       assert.equal(payload.navigation.workspacePath, tempRoot);
       assert.equal(payload.navigation.selectedSessionId, "session_parent");
       assert.equal(payload.navigation.selectedFilePath, "notes.md");
       assert.equal(payload.navigation.focusedPanel, "workbench");
+      assert.equal(payload.navigation.conversationPane, "open");
+      assert.equal(payload.navigation.terminalPane, "collapsed");
     } finally {
       server.close();
       await once(server, "close");
@@ -207,9 +226,7 @@ describe("ide shell server", () => {
 
   test("会接收终端命令请求，并返回 workbench 导航", async () => {
     const service = await seedIdeShellService();
-    let captured:
-      | { workspacePath: string; sessionId?: string; selectedFilePath?: string; command: string }
-      | undefined;
+    let captured: IdeShellTerminalRunRequest | undefined;
     const server = createIdeShellServer(service, {
       defaultWorkspacePath: "/tmp/project",
       runTerminal: async (input) => {
@@ -240,6 +257,8 @@ describe("ide shell server", () => {
           sessionId: "session_parent",
           selectedFilePath: "apps/ide-web/src/browser.ts",
           command: "pwd",
+          conversationPane: "collapsed",
+          terminalPane: "collapsed",
         }),
       });
       const payload = (await response.json()) as {
@@ -248,6 +267,8 @@ describe("ide shell server", () => {
           selectedSessionId?: string;
           selectedFilePath?: string;
           focusedPanel: string;
+          conversationPane: "open" | "collapsed";
+          terminalPane: "open" | "collapsed";
         };
       };
 
@@ -257,11 +278,15 @@ describe("ide shell server", () => {
         sessionId: "session_parent",
         selectedFilePath: "apps/ide-web/src/browser.ts",
         command: "pwd",
+        conversationPane: "collapsed",
+        terminalPane: "collapsed",
       });
       assert.equal(payload.navigation.workspacePath, "/tmp/project");
       assert.equal(payload.navigation.selectedSessionId, "session_parent");
       assert.equal(payload.navigation.selectedFilePath, "apps/ide-web/src/browser.ts");
       assert.equal(payload.navigation.focusedPanel, "workbench");
+      assert.equal(payload.navigation.conversationPane, "collapsed");
+      assert.equal(payload.navigation.terminalPane, "collapsed");
     } finally {
       server.close();
       await once(server, "close");

@@ -24,6 +24,8 @@ describe("ide browser runtime", () => {
       selectedParentTaskId: "task_parent",
       selectedTimelineIndex: 1,
       focusedPanel: "inspector",
+      conversationPane: "collapsed",
+      terminalPane: "collapsed",
     });
     const parsed = parseIdeShellNavigation(search);
 
@@ -35,6 +37,8 @@ describe("ide browser runtime", () => {
       selectedParentTaskId: "task_parent",
       selectedTimelineIndex: 1,
       focusedPanel: "inspector",
+      conversationPane: "collapsed",
+      terminalPane: "collapsed",
     });
   });
 
@@ -57,13 +61,39 @@ describe("ide browser runtime", () => {
     assert.equal(nextNavigation.selectedRunId, "subagent_run_1");
   });
 
+  test("会把 pane toggle 动作编码回导航参数", async () => {
+    const service = await seedIdeShellService();
+    const initial = await buildIdeShellState(service, {
+      workspacePath: "/tmp/project",
+      conversationPane: "open",
+      terminalPane: "open",
+    });
+    const action = parseIdeShellActionDataset({
+      action: "toggle-conversation-pane",
+    });
+
+    assert.deepEqual(action, {
+      type: "toggle-conversation-pane",
+    });
+
+    const nextNavigation = reduceIdeShellBrowserAction(initial, action);
+
+    assert.equal(nextNavigation.conversationPane, "collapsed");
+    assert.equal(nextNavigation.terminalPane, "open");
+    assert.equal(nextNavigation.focusedPanel, "workbench");
+  });
+
   test("会渲染出带浏览器运行时脚本的 IDE 文档", async () => {
     const service = await seedIdeShellService();
     const state = await buildIdeShellState(service, {
       workspacePath: "/tmp/project",
+      conversationPane: "collapsed",
+      terminalPane: "collapsed",
     });
     const html = renderIdeShellBrowserDocument(state, {
       workspacePath: "/tmp/project",
+      conversationPane: "collapsed",
+      terminalPane: "collapsed",
     });
 
     assert.match(html, /data-browser-runtime="ide-shell"/);
@@ -71,9 +101,12 @@ describe("ide browser runtime", () => {
     assert.match(html, /id="ide-shell-state"/);
     assert.match(html, /window\.history\.replaceState/);
     assert.match(html, /fetch\(invokePath/);
-    assert.match(html, /data-ide-submit="invoke"/);
     assert.match(html, /terminalRunPath/);
     assert.match(html, /data-action="open-replay"/);
+    assert.match(html, /Show Agent/);
+    assert.match(html, /Show Terminal/);
+    assert.match(html, /conversationPane":"collapsed"/);
+    assert.match(html, /terminalPane":"collapsed"/);
   });
 
   test("当文件面板可用时，浏览器文档会包含保存文件表单", async () => {

@@ -35,6 +35,8 @@ export interface IdeShellNavigationInput {
   selectedParentTaskId?: string;
   selectedTimelineIndex?: number;
   focusedPanel?: IdePanelId;
+  conversationPane?: "open" | "collapsed";
+  terminalPane?: "open" | "collapsed";
 }
 
 export interface IdeShellSessionItem {
@@ -117,6 +119,8 @@ export interface IdeShellTerminalEntryState {
 export interface IdeShellState {
   workspacePath: string;
   focusedPanel: IdePanelId;
+  conversationPane: "open" | "collapsed";
+  terminalPane: "open" | "collapsed";
   sessions: IdeShellSessionItem[];
   selectedSessionId?: string;
   selectedSessionTitle?: string;
@@ -153,7 +157,9 @@ export type IdeShellAction =
   | { type: "open-file"; filePath: string }
   | { type: "open-replay"; runId: string }
   | { type: "open-parent-task"; parentTaskId: string }
-  | { type: "inspect-timeline"; index: number };
+  | { type: "inspect-timeline"; index: number }
+  | { type: "toggle-conversation-pane" }
+  | { type: "toggle-terminal-pane" };
 
 function escapeHtml(value: string): string {
   return value
@@ -204,6 +210,12 @@ export function normalizeIdePanelId(value: string | undefined): IdePanelId | und
   }
 
   return undefined;
+}
+
+function normalizePaneVisibility(
+  value: string | undefined,
+): "open" | "collapsed" {
+  return value === "collapsed" ? "collapsed" : "open";
 }
 
 function resolveWithinWorkspace(workspacePath: string, candidatePath = "."): string {
@@ -391,6 +403,8 @@ export async function buildIdeShellState(
     return {
       workspacePath: input.workspacePath,
       focusedPanel: normalizeIdePanelId(input.focusedPanel) ?? "workbench",
+      conversationPane: normalizePaneVisibility(input.conversationPane),
+      terminalPane: normalizePaneVisibility(input.terminalPane),
       sessions: [],
       selectedSessionTaskCount: 0,
       selectedSessionSubagentRunCount: 0,
@@ -469,6 +483,8 @@ export async function buildIdeShellState(
   return {
     workspacePath: input.workspacePath,
     focusedPanel: normalizeIdePanelId(input.focusedPanel) ?? "workbench",
+    conversationPane: normalizePaneVisibility(input.conversationPane),
+    terminalPane: normalizePaneVisibility(input.terminalPane),
     sessions: sessionsState,
     selectedSessionId: selectedSession.id,
     selectedSessionTitle: selectedSession.title,
@@ -550,6 +566,8 @@ export function reduceIdeShellNavigation(
         selectedParentTaskId: current.selectedParentTaskId,
         selectedTimelineIndex: current.selectedTimelineIndex,
         focusedPanel: action.panel,
+        conversationPane: current.conversationPane,
+        terminalPane: current.terminalPane,
       };
     case "select-session":
       return {
@@ -557,6 +575,8 @@ export function reduceIdeShellNavigation(
         selectedSessionId: action.sessionId,
         selectedFilePath: current.selectedFilePath,
         focusedPanel: "workbench",
+        conversationPane: current.conversationPane,
+        terminalPane: current.terminalPane,
       };
     case "open-file":
       return {
@@ -566,6 +586,8 @@ export function reduceIdeShellNavigation(
         selectedRunId: current.selectedRunId,
         selectedParentTaskId: current.selectedParentTaskId,
         focusedPanel: "workbench",
+        conversationPane: current.conversationPane,
+        terminalPane: current.terminalPane,
       };
     case "open-replay":
       return {
@@ -575,6 +597,8 @@ export function reduceIdeShellNavigation(
         selectedRunId: action.runId,
         selectedParentTaskId: current.selectedParentTaskId,
         focusedPanel: "subagent-replay",
+        conversationPane: current.conversationPane,
+        terminalPane: current.terminalPane,
       };
     case "open-parent-task":
       return {
@@ -584,6 +608,8 @@ export function reduceIdeShellNavigation(
         selectedRunId: current.selectedRunId,
         selectedParentTaskId: action.parentTaskId,
         focusedPanel: "parent-task-delegation",
+        conversationPane: current.conversationPane,
+        terminalPane: current.terminalPane,
       };
     case "inspect-timeline":
       return {
@@ -594,6 +620,32 @@ export function reduceIdeShellNavigation(
         selectedParentTaskId: current.selectedParentTaskId,
         selectedTimelineIndex: action.index,
         focusedPanel: "inspector",
+        conversationPane: current.conversationPane,
+        terminalPane: current.terminalPane,
+      };
+    case "toggle-conversation-pane":
+      return {
+        workspacePath: current.workspacePath,
+        selectedSessionId: current.selectedSessionId,
+        selectedFilePath: current.selectedFilePath,
+        selectedRunId: current.selectedRunId,
+        selectedParentTaskId: current.selectedParentTaskId,
+        selectedTimelineIndex: current.selectedTimelineIndex,
+        focusedPanel: current.focusedPanel,
+        conversationPane: current.conversationPane === "open" ? "collapsed" : "open",
+        terminalPane: current.terminalPane,
+      };
+    case "toggle-terminal-pane":
+      return {
+        workspacePath: current.workspacePath,
+        selectedSessionId: current.selectedSessionId,
+        selectedFilePath: current.selectedFilePath,
+        selectedRunId: current.selectedRunId,
+        selectedParentTaskId: current.selectedParentTaskId,
+        selectedTimelineIndex: current.selectedTimelineIndex,
+        focusedPanel: current.focusedPanel,
+        conversationPane: current.conversationPane,
+        terminalPane: current.terminalPane === "open" ? "collapsed" : "open",
       };
   }
 }
@@ -850,16 +902,31 @@ function renderFilesPanel(state: IdeShellState): string {
 
 function renderTerminalSection(state: IdeShellState): string {
   return `
-    <section class="panel terminal-panel">
+    <section class="panel terminal-panel${state.terminalPane === "collapsed" ? " is-collapsed" : ""}">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Terminal</p>
           <h3>Workspace Command Runner</h3>
         </div>
-        <span class="pill">${state.terminalEntries.length} entries</span>
+        <div class="status-pills">
+          <span class="pill">${state.terminalEntries.length} entries</span>
+          <button
+            type="button"
+            class="ghost-button"
+            data-action="toggle-terminal-pane"
+          >
+            ${state.terminalPane === "collapsed" ? "Show Terminal" : "Hide Terminal"}
+          </button>
+        </div>
       </div>
+      ${
+        state.terminalPane === "collapsed"
+          ? `<p class="muted">Terminal 已折叠。点击上面的按钮后，会重新展开最近命令历史和运行入口。</p>`
+          : `
       <form class="terminal-form" data-ide-submit="terminal-run">
         <input type="hidden" name="workspacePath" value="${escapeHtml(state.workspacePath)}" />
+        <input type="hidden" name="conversationPane" value="${escapeHtml(state.conversationPane)}" />
+        <input type="hidden" name="terminalPane" value="${escapeHtml(state.terminalPane)}" />
         ${
           state.selectedSessionId
             ? `<input type="hidden" name="sessionId" value="${escapeHtml(state.selectedSessionId)}" />`
@@ -909,13 +976,15 @@ function renderTerminalSection(state: IdeShellState): string {
           `
           : `<div class="empty-state"><h3>终端历史为空</h3><p>先在上面执行一条命令，这里就会显示最近的输出结果。</p></div>`
       }
+      `
+      }
     </section>
   `;
 }
 
 function renderWorkbenchPanel(state: IdeShellState): string {
   return `
-    <section class="panel workbench-panel">
+    <section class="panel workbench-panel${state.conversationPane === "collapsed" ? " is-conversation-collapsed" : ""}${state.terminalPane === "collapsed" ? " is-terminal-collapsed" : ""}">
       <div class="panel-header">
         <div>
           <p class="eyebrow">Workbench</p>
@@ -925,14 +994,41 @@ function renderWorkbenchPanel(state: IdeShellState): string {
           <span class="pill">${escapeHtml(state.selectedSessionAgentMode ?? "build")}</span>
           <span class="pill">${escapeHtml(state.selectedSessionStatus ?? "draft")}</span>
           <span class="pill">${escapeHtml(state.selectedGoalTitle ?? "暂无 goal")}</span>
+          <button
+            type="button"
+            class="ghost-button"
+            data-action="toggle-conversation-pane"
+          >
+            ${state.conversationPane === "collapsed" ? "Show Agent" : "Hide Agent"}
+          </button>
+          <button
+            type="button"
+            class="ghost-button"
+            data-action="toggle-terminal-pane"
+          >
+            ${state.terminalPane === "collapsed" ? "Show Terminal" : "Hide Terminal"}
+          </button>
         </div>
       </div>
       <div class="workbench-grid">
-        <section class="panel workbench-column conversation-shell">
+        <section class="panel workbench-column conversation-shell${state.conversationPane === "collapsed" ? " is-collapsed" : ""}">
           <div class="section-heading">
             <h3>Conversation</h3>
-            <span>${state.messages.length} messages</span>
+            <div class="status-pills">
+              <span>${state.messages.length} messages</span>
+              <button
+                type="button"
+                class="ghost-button"
+                data-action="toggle-conversation-pane"
+              >
+                ${state.conversationPane === "collapsed" ? "Show" : "Hide"}
+              </button>
+            </div>
           </div>
+          ${
+            state.conversationPane === "collapsed"
+              ? `<div class="empty-state compact-empty-state"><h3>Agent 已折叠</h3><p>点击上面的 Show 或右上角 Show Agent 可以重新展开对话区。</p></div>`
+              : `
           <div class="message-list workbench-scroll">
             ${
               state.messages.length > 0
@@ -959,6 +1055,8 @@ function renderWorkbenchPanel(state: IdeShellState): string {
           </div>
           <form class="composer workbench-composer" data-ide-submit="invoke">
             <input type="hidden" name="workspacePath" value="${escapeHtml(state.workspacePath)}" />
+            <input type="hidden" name="conversationPane" value="${escapeHtml(state.conversationPane)}" />
+            <input type="hidden" name="terminalPane" value="${escapeHtml(state.terminalPane)}" />
             ${
               state.selectedSessionId
                 ? `<input type="hidden" name="sessionId" value="${escapeHtml(state.selectedSessionId)}" />`
@@ -988,6 +1086,8 @@ function renderWorkbenchPanel(state: IdeShellState): string {
               <button type="submit" class="primary-button">Run Agent</button>
             </div>
           </form>
+          `
+          }
         </section>
         <section class="workspace-stack">
           <section class="panel workspace-top-shell">
@@ -1046,10 +1146,12 @@ function renderWorkbenchPanel(state: IdeShellState): string {
                       <form class="file-editor-form" data-ide-submit="save-file">
                         <input type="hidden" name="workspacePath" value="${escapeHtml(state.workspacePath)}" />
                         <input type="hidden" name="filePath" value="${escapeHtml(state.filePreview.path)}" />
+                        <input type="hidden" name="conversationPane" value="${escapeHtml(state.conversationPane)}" />
+                        <input type="hidden" name="terminalPane" value="${escapeHtml(state.terminalPane)}" />
                         ${
                           state.selectedSessionId
                             ? `<input type="hidden" name="sessionId" value="${escapeHtml(state.selectedSessionId)}" />`
-                            : ""
+                          : ""
                         }
                         <label class="composer-label" for="ide-file-editor">File Content</label>
                         <textarea
@@ -1678,7 +1780,10 @@ export function renderIdeShellDocument(state: IdeShellState): string {
         gap: 18px;
         align-items: stretch;
         min-height: 0;
-        height: clamp(720px, 72vh, 920px);
+        height: clamp(840px, 80vh, 1080px);
+      }
+      .workbench-panel.is-conversation-collapsed .workbench-grid {
+        grid-template-columns: minmax(0, 1fr);
       }
       .workbench-column {
         display: grid;
@@ -1691,6 +1796,9 @@ export function renderIdeShellDocument(state: IdeShellState): string {
         overflow: hidden;
         height: 100%;
       }
+      .conversation-shell.is-collapsed {
+        display: none;
+      }
       .workspace-stack {
         display: grid;
         grid-template-rows: minmax(0, 1fr) clamp(220px, 30vh, 320px);
@@ -1698,6 +1806,9 @@ export function renderIdeShellDocument(state: IdeShellState): string {
         min-height: 0;
         height: 100%;
         overflow: hidden;
+      }
+      .workbench-panel.is-terminal-collapsed .workspace-stack {
+        grid-template-rows: minmax(0, 1fr);
       }
       .workspace-top-shell {
         padding: 18px;
@@ -1813,6 +1924,12 @@ export function renderIdeShellDocument(state: IdeShellState): string {
         min-height: 0;
         overflow: hidden;
         grid-template-rows: auto auto minmax(0, 1fr);
+      }
+      .terminal-panel.is-collapsed {
+        grid-template-rows: auto auto;
+      }
+      .compact-empty-state {
+        align-self: start;
       }
       .terminal-form {
         display: grid;
