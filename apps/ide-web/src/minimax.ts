@@ -1107,6 +1107,14 @@ export function createMiniMaxHooks(options?: MiniMaxHooksOptions): LangGraphHook
     throw new Error("fetch is not available in the current runtime");
   }
 
+  // 这里把 MiniMax provider 适配成 LangGraphHooks。
+  // 一个关键理解是：模型层并不知道 LangGraph graph、RuntimeStore 或文件系统。
+  // 它只知道“当前节点要返回什么结构化 JSON”。
+  //
+  // 真正的落地动作仍然是后面的 graph/service/toolExecutor 在做：
+  // - graph 负责编排顺序
+  // - service 负责业务持久化
+  // - toolExecutor 负责真实工具循环
   return {
     goalFactory: async (input): Promise<LangGraphGoalDraft | null> => {
       if (!input.userMessage?.trim()) {

@@ -21,6 +21,15 @@ import type {
 import { GoalDrivenRuntimeService } from "./service.js";
 import type { RuntimeToolExecutor } from "./tooling.js";
 
+// 这一组 interface/type 是“项目自己的 LangGraph 适配层合同”。
+// 它们不是 LangGraph 官方 API，而是我们为了把“模型节点输出”接进 runtime，
+// 专门定义的一层稳定边界。
+//
+// 看这个文件时最好先把概念分开：
+// 1. LangGraph 官方概念：Annotation / StateGraph / START / END / BaseCheckpointSaver
+// 2. 项目自定义概念：LangGraphHooks / LangGraphExecuteResult / AgentLangGraphRuntime
+//
+// 这样面试时不容易把“框架能力”和“项目自己的工程设计”混为一谈。
 export interface LangGraphInvokeInput {
   sessionId: string;
   userMessage?: string;
@@ -49,6 +58,14 @@ export interface LangGraphToolCall {
   reasoning?: string;
 }
 
+// LangGraphHooks 是 provider 和 graph 之间最重要的接缝。
+// 它把“某个模型供应商应该为每个节点产出什么结构化结果”这件事收成统一合同。
+//
+// 这些 hook 都只返回 JSON 草案，不直接操作数据库或文件系统：
+// - 真正写 goal/plan/task/memory 的是 GoalDrivenRuntimeService
+// - 真正调用文件工具的是 RuntimeToolExecutor
+//
+// 这层抽象的价值是：换模型时尽量只改 hooks，不改 graph 主体。
 export interface LangGraphHooks {
   goalFactory?: (input: LangGraphInvokeInput) => Promise<LangGraphGoalDraft | null> | LangGraphGoalDraft | null;
   planner?: (
@@ -96,6 +113,13 @@ export interface LangGraphRuntimeOptions {
   toolExecutor?: RuntimeToolExecutor;
 }
 
+// AgentLangGraphAnnotation 就是“这张 LangGraph 图的状态 schema”。
+// Annotation.Root(...) 的作用，是显式声明：
+// - 每个节点之间会传哪些字段
+// - 这些字段怎么 merge/reduce
+//
+// 这里最典型的是 executionLog：
+// 每个节点都只返回本轮新增日志，再由 reducer 统一追加到整条执行历史里。
 export const AgentLangGraphAnnotation = Annotation.Root({
   sessionId: Annotation<string>,
   userMessage: Annotation<string | undefined>,
@@ -920,6 +944,13 @@ export function createAgentLangGraph(
     .addNode("review", reviewNode)
     .addNode("summarize", summarizeNode)
     .addNode("continue-or-close", closeNode)
+    // 这里是真正运行时会执行的固定主链。
+    // 也就是说：
+    // - graph.ts 里的 ALLOWED_TRANSITIONS 负责描述“允许的设计空间”
+    // - 这里的 addEdge(...) 才是当前 LangGraph 真正会怎么跑
+    //
+    // 当前项目还没有把条件分支完全收成“由 ALLOWED_TRANSITIONS 动态驱动”，
+    // 所以面试时应该明确说：状态机合同已经抽出来了，但当前 runtime 仍是一条固定主链。
     .addEdge(START, "intake")
     .addEdge("intake", "clarify")
     .addEdge("clarify", "plan")
@@ -938,10 +969,22 @@ export function createAgentLangGraph(
   return new AgentLangGraphRuntime(graph);
 }
 
+// AgentLangGraphRuntime 是给应用层用的薄包装。
+// 它故意不把 LangGraph 全部 API 都往上暴露，只保留：
+// - invoke: 跑一轮图
+// - getThreadState: 调试 thread 快照
+// - getCompiledGraph: 测试/调试时拿到底层 graph
+//
+// 这样上层依赖的是“项目自己的 runtime API”，而不是直接贴着框架细节写。
 export class AgentLangGraphRuntime {
   constructor(private readonly graph: AgentLangGraphCompiled) {}
 
   async invoke(input: LangGraphInvokeInput): Promise<AgentLangGraphState> {
+    // 这里最关键的设计是：
+    // thread_id === sessionId
+    //
+    // 这样 session 恢复语义和 LangGraph thread 恢复语义就统一了，
+    // 后续 durable execution / getState / checkpoint 查询都会更直观。
     return (await this.graph.invoke(
       {
         sessionId: input.sessionId,
@@ -957,6 +1000,9 @@ export class AgentLangGraphRuntime {
   }
 
   async getThreadState(sessionId: string): Promise<StateSnapshot> {
+    // getState(...) 拿到的是 LangGraph 自己的 thread 快照。
+    // 它适合调试“图跑到了哪、Annotation values 是什么”，
+    // 但不应该代替 RuntimeStore 去查询完整业务实体。
     return this.graph.getState({
       configurable: {
         thread_id: sessionId,

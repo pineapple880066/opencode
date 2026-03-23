@@ -42,11 +42,14 @@
 
 先读：
 
+- `docs/langgraph-in-project.md`
 - `docs/project-deep-dive.md`
 
 为什么先看它：
 
-因为这份文档不是简单列文件名，而是按“分层 -> 业务服务 -> 编排 -> 工具控制环 -> provider 适配 -> IDE workbench -> 测试与排错”的顺序，把当前仓库最重要的实现链路讲成了一条可跟读的路线。
+`docs/langgraph-in-project.md` 是 LangGraph 专项文档，适合你先把“框架概念”和“项目自定义适配层”彻底分开。
+
+`docs/project-deep-dive.md` 则不是简单列文件名，而是按“分层 -> 业务服务 -> 编排 -> 工具控制环 -> provider 适配 -> IDE workbench -> 测试与排错”的顺序，把当前仓库最重要的实现链路讲成了一条可跟读的路线。
 
 如果你现在的目标不是继续写功能，而是先把项目彻底吃透，这份文档应该是第一入口。
 
@@ -96,6 +99,7 @@
 再读：
 
 - `packages/runtime/src/graph.ts`
+- `packages/runtime/src/langgraph.ts`
 - `packages/runtime/src/service.ts`
 
 为什么读它：
@@ -108,12 +112,16 @@
 - `AgentGraphState`
 - `CORE_WORKFLOW`
 - `ALLOWED_TRANSITIONS`
+- `AgentLangGraphAnnotation`
+- `createAgentLangGraph()`
+- `AgentLangGraphRuntime.invoke()`
 
 你可以把它理解成：
 
 其中：
 
 - `graph.ts` 更像 workflow 合同
+- `langgraph.ts` 更像 LangGraph 编排层
 - `service.ts` 更像应用服务层，负责 goal、plan、subagent、summary、replay、cleanup 这些真实动作
 
 你可以把它理解成：
@@ -182,6 +190,17 @@
 - 为什么 `.env` 会同时被应用脚本和 compose 复用
 
 如果你现在最想做的是把本地依赖先起起来，再跑 smoke，这两份文件就是第一入口。
+
+### 6.5 单独把 LangGraph 持久化看一遍
+
+再读：
+
+- `packages/db/src/langgraph-checkpointer.ts`
+- `packages/db/sql/001_initial_schema.sql`
+
+为什么它们值得单独看：
+
+很多人会以为“LangGraph 接了就自动 durable execution 了”，其实不是。这个仓库里真正把 `thread checkpoint / pending writes` 落进 MySQL 的，是自定义 saver 和两张专门的表。
 
 ### 7. 再看 IDE 面板状态怎么接 runtime
 

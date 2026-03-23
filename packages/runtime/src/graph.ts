@@ -91,6 +91,17 @@ export const CORE_WORKFLOW: WorkflowNode[] = [
 
 // 允许的状态跳转用来约束流程，避免 runtime 从 intake 直接跳到“完成”，
 // 中间完全没有 plan 或 review。
+//
+// 这里还要分清“设计合同”和“真实运行时”：
+// - 这里的 ALLOWED_TRANSITIONS 是 workflow contract，定义理论上允许怎么跳
+// - packages/runtime/src/langgraph.ts 里的 .addEdge(...) 才是当前这版 LangGraph 真正会怎么跑
+//
+// 所以它现在已经很适合做：
+// - 阅读时理解状态机
+// - 后续接条件路由
+// - 测试里校验某次跳转是否合法
+//
+// 但还不能说“当前运行时已经完全由这张表动态驱动”。
 const ALLOWED_TRANSITIONS: Record<WorkflowNode, WorkflowNode[]> = {
   intake: ["clarify", "plan"],
   clarify: ["plan", "continue-or-close"],

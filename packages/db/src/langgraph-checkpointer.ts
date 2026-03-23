@@ -44,6 +44,9 @@ export interface SerializedCheckpointWriteRecord {
   updatedAt: string;
 }
 
+// 这个 repository 是“LangGraph 持久化语义”和“底层数据库实现”之间的最小抽象。
+// BaseCheckpointSaver 需要的是 get/list/put/putWrites/deleteThread 这组能力，
+// 并不关心背后到底是 MySQL 还是别的存储。
 export interface LangGraphCheckpointRepository {
   getCheckpoint(
     threadId: string,
@@ -71,6 +74,12 @@ function normalizeCheckpointNamespace(value: string | undefined): string {
   return value ?? "";
 }
 
+// LangGraph 的 durable execution 依赖 RunnableConfig.configurable 里的几个关键字段：
+// - thread_id: 当前线程。项目里直接等于 sessionId
+// - checkpoint_ns: 可选命名空间
+// - checkpoint_id: 某个具体 checkpoint
+//
+// 这些字段缺失时，saver 无法知道该把状态保存到哪里，也无法从哪里恢复。
 function requireThreadId(config: RunnableConfig, operation: string): string {
   const threadId = config.configurable?.thread_id;
   if (!threadId) {
@@ -176,6 +185,11 @@ export class PersistentLangGraphCheckpointSaver extends BaseCheckpointSaver {
     super();
   }
 
+  // getTuple 是恢复线程状态时最核心的方法。
+  // 它不仅要还原 checkpoint 本体，还要还原：
+  // - metadata
+  // - pending writes
+  // - parent checkpoint 关系
   async getTuple(config: RunnableConfig): Promise<CheckpointTuple | undefined> {
     const threadId = config.configurable?.thread_id;
     if (!threadId) {
@@ -221,6 +235,7 @@ export class PersistentLangGraphCheckpointSaver extends BaseCheckpointSaver {
     return tuple;
   }
 
+  // list 用在回放、调试、筛选 checkpoint 这些场景。
   async *list(config: RunnableConfig, options?: CheckpointListOptions): AsyncGenerator<CheckpointTuple> {
     const rows = await this.repository.listCheckpoints({
       threadId: config.configurable?.thread_id,
@@ -273,6 +288,7 @@ export class PersistentLangGraphCheckpointSaver extends BaseCheckpointSaver {
     }
   }
 
+  // put 保存 checkpoint 主体，也就是“某次节点执行后的图状态快照”。
   async put(
     config: RunnableConfig,
     checkpoint: Checkpoint,
@@ -306,6 +322,8 @@ export class PersistentLangGraphCheckpointSaver extends BaseCheckpointSaver {
     };
   }
 
+  // putWrites 保存的是 LangGraph channel 的 pending writes。
+  // 它和 checkpoint 主体分开存，是因为恢复时两者都需要。
   async putWrites(config: RunnableConfig, writes: PendingWrite[], taskId: string): Promise<void> {
     const threadId = requireThreadId(config, "put writes");
     const checkpointNs = normalizeCheckpointNamespace(config.configurable?.checkpoint_ns);
@@ -353,6 +371,8 @@ export class PersistentLangGraphCheckpointSaver extends BaseCheckpointSaver {
   }
 }
 
+// 这一层只做 MySQL adapter，不做 LangGraph 业务判断。
+// 它的职责是把 saver 需要的 record 结构映射到 SQL 表。
 export class MySqlLangGraphCheckpointRepository implements LangGraphCheckpointRepository {
   constructor(private readonly pool: Pool) {}
 
@@ -539,5 +559,7 @@ export class MySqlLangGraphCheckpointRepository implements LangGraphCheckpointRe
 }
 
 export function createMySqlLangGraphCheckpointSaver(pool: Pool): PersistentLangGraphCheckpointSaver {
+  // 组合根最终拿到的是 saver，而不是直接操作 repository。
+  // 这样依赖方向更清晰：应用层依赖 LangGraph saver 语义，底层再由 MySQL 实现细节。
   return new PersistentLangGraphCheckpointSaver(new MySqlLangGraphCheckpointRepository(pool));
 }

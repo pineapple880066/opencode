@@ -147,6 +147,98 @@
 
 你现在仓库里已经把这条阅读顺序写成了 `docs/project-deep-dive.md`。面试准备时，最好先沿那份文档复习一遍，再来把每一节压缩成 30 秒、2 分钟和 5 分钟版本。
 
+如果面试官明确盯着 LangGraph 问，你现在仓库里还有一份专项材料：
+
+- `docs/langgraph-in-project.md`
+
+那份文档适合专门回答这些问题：
+
+- LangGraph 到底是什么
+- 这个项目里到底用了哪些 LangGraph 官方接口
+- 哪些是项目自己写的适配层
+- `thread_id / checkpoint_id / checkpoint_ns` 在这里具体代表什么
+- 浏览器 prompt 是怎么真正进入 graph 的
+- MySQL checkpointer 到底是怎么工作的
+
+## LangGraph 这一块，面试时怎么讲才不塌
+
+这部分不要从“我用了一个框架”开始讲，而要从“我把什么交给 LangGraph、什么留在项目自己手里”开始讲。
+
+建议答法：
+
+“我把 LangGraph 当成编排层，不当成业务中心。它负责节点顺序、graph state、thread checkpoint 和恢复；而 session、goal、plan、task、memory、tool policy、tool execution 这些业务动作，还是走我自己的 runtime service 和 toolExecutor。这样做的好处是框架负责 orchestration，我自己的代码负责领域规则，两边职责比较清楚。”
+
+继续往下讲时，可以补：
+
+“我先在 `packages/runtime/src/graph.ts` 里定义 workflow 合同和 `AgentGraphState`，再在 `packages/runtime/src/langgraph.ts` 里用 `Annotation.Root` 定义 LangGraph state，用 `StateGraph` 把 `intake -> clarify -> plan -> delegate -> execute -> review -> summarize -> continue-or-close` 接成主链。调用时我把 `thread_id` 直接对齐成 `sessionId`，这样 session 恢复和 graph 恢复就是同一个语义。”
+
+再补 durable execution：
+
+“LangGraph 官方 JS 版没有现成 MySQL saver，所以我自己实现了一个 `PersistentLangGraphCheckpointSaver`，把 checkpoint 和 pending writes 分别落到 `langgraph_checkpoints` 和 `langgraph_checkpoint_writes` 两张表里。这样 graph 的 checkpoint 恢复可以直接贴到 MySQL，而不用为了迎合框架去换存储架构。”
+
+## LangGraph 这一块，最容易被追问的 4 个点
+
+### 1. 你的状态机是不是已经完全数据驱动了？
+
+当前不是。
+
+虽然 `packages/runtime/src/graph.ts` 里已经有：
+
+- `WorkflowNode`
+- `CORE_WORKFLOW`
+- `ALLOWED_TRANSITIONS`
+- `canTransitionTo(...)`
+
+但当前真正运行时会执行的主链，还是 `packages/runtime/src/langgraph.ts` 里这一串固定的 `.addEdge(...)`。
+
+所以正确说法应该是：
+
+- 设计上已经把状态机合同抽出来了
+- 但当前 LangGraph 仍然是固定主链
+- `ALLOWED_TRANSITIONS` 目前更像 workflow contract，而不是已完全驱动 runtime branching 的唯一真相源
+
+### 2. 你是怎么把模型接进 LangGraph 的？
+
+正确答法不是“我在 graph 里直接调 MiniMax”。
+
+更准确的说法是：
+
+- `apps/ide-web/src/minimax.ts` 通过 `createMiniMaxHooks()` 返回 `LangGraphHooks`
+- 每个 hook 只负责给某个 graph 节点返回结构化 JSON
+- graph 自己再决定如何调用 `service` 和 `toolExecutor`
+
+也就是说：
+
+- provider 适配层负责“怎么让模型按节点输出结构化结果”
+- LangGraph 负责编排顺序
+- runtime service 负责真正的业务落地
+
+### 3. 你怎么处理 durable execution？
+
+这里一定要把两个层次分清楚：
+
+- LangGraph 官方需要的是 `BaseCheckpointSaver`
+- 项目真正实现的是 `PersistentLangGraphCheckpointSaver`
+
+调用链是：
+
+1. `apps/ide-web/src/bootstrap.ts` 里创建 `createMySqlLangGraphCheckpointSaver(mysql.pool)`
+2. 再把这个 saver 注入 `createAgentLangGraph(...)`
+3. `StateGraph.compile({ checkpointer })` 后，graph 的 invoke/getState 才真正带 durable execution 语义
+
+### 4. 你这个项目里最难的 LangGraph 点是什么？
+
+最值得讲的不是 `addNode/addEdge`，而是 execute control loop。
+
+因为图搭起来不难，真正难的是：
+
+- mixed explain + edit 请求，怎么避免重复 `view`
+- 工具循环怎么避免打转
+- provider 输出脏 JSON 时，怎么不让整条 graph 直接 500
+- 什么时候允许 reread，什么时候该强制进入 modify
+
+这其实是一个“LangGraph 编排 + 工具合同 + provider 适配 + 执行纪律”四层一起作用的问题。
+
 ## 当前已经实现到哪
 
 这部分你面试时一定要诚实：

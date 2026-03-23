@@ -54,6 +54,9 @@ async function main(): Promise<void> {
               agentMode: "build",
             });
 
+      // 这是浏览器 prompt 真正进入 LangGraph 的位置。
+      // server.ts 负责 HTTP 和导航协议；到这里 session 已经准备好，
+      // 接下来才正式跑一次 intake -> ... -> continue-or-close 主链。
       await runtime.langGraph.invoke({
         sessionId: session.id,
         userMessage: input.prompt,
