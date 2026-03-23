@@ -142,6 +142,14 @@ export function createIdeShellRequestHandler(
   const terminalRunPath = options.terminalRunPath ?? "/__ide__/terminal/run";
 
   return async (request, response) => {
+    // 这个 request handler 是浏览器工作台的服务端边界。
+    // 它同时处理两类请求：
+    // 1. 取页面 / 取状态：返回 HTML 或 shell state JSON
+    // 2. 执行动作：invoke、save-file、terminal-run
+    //
+    // 这里刻意不做复杂前端状态管理，而是把“当前页面应该是什么样”
+    // 委托给 buildIdeShellState + renderIdeShellBrowserDocument。
+    // 所以浏览器和服务端共享的是“导航协议”，而不是两套互相漂移的状态树。
     if (!request.url) {
       writeResponse(response, 400, "text/plain; charset=utf-8", "Bad Request", request.method);
       return;
@@ -332,6 +340,10 @@ export function createIdeShellRequestHandler(
           return;
         }
 
+        // invoke 路由是 agent 入口。
+        // 它不直接返回一段 assistant 文本，而是返回“下一次导航应该怎么走”。
+        // 这样浏览器收到响应后，会重新拉一份最新 shell 文档，
+        // 页面看到的就是已经包含新消息、新 checkpoint、新工具痕迹的完整状态。
         const invokeResult = await options.invoke({
           workspacePath,
           prompt,
@@ -387,6 +399,12 @@ export function createIdeShellRequestHandler(
 
       writeResponse(response, 404, "text/plain; charset=utf-8", "Not Found", request.method);
     } catch (error) {
+      // 这里的 catch 不是简单兜底，而是专门区分：
+      // - IDE API 请求：必须返回 JSON error，方便浏览器 runtime 解析
+      // - 文档请求：返回纯文本 500 即可
+      //
+      // 之前如果这里一律回纯文本，浏览器端再去 response.json()，
+      // 会先炸出一个新的 SyntaxError，把真实后端错误掩盖掉。
       const message = error instanceof Error ? error.message : "Unknown Error";
       console.error("[agent-ide] IDE shell request failed", {
         method: request.method,

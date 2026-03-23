@@ -285,6 +285,13 @@ async function buildWorkspaceBrowserState(
   selectedFilePath?: string;
   preview?: IdeShellFilePreviewState;
 }> {
+  // 这是 workbench 里的“最小文件浏览器”状态构造器。
+  // 它负责两件事：
+  // 1. 扫当前 workspace，生成一个受控的文件树
+  // 2. 读取当前选中文件，给 editor 面板准备完整内容和预览摘要
+  //
+  // 为什么这里直接做读取，而不是把文件面板完全下沉到前端？
+  // 因为当前这版 IDE 是 server-driven shell，服务端负责把“当前应该展示什么”一次算好。
   try {
     const normalizedRoot = path.resolve(workspacePath);
     const entries: IdeShellWorkspaceEntry[] = [];
@@ -392,6 +399,17 @@ export async function buildIdeShellState(
   input: IdeShellNavigationInput,
   options: IdeShellBuildOptions = {},
 ): Promise<IdeShellState> {
+  // buildIdeShellState 是整个 workbench 的状态拼装中心。
+  // 如果你想理解“浏览器里为什么会同时看到 session、message、goal、plan、文件和终端”，
+  // 这里就是第一入口。
+  //
+  // 它会把几类数据统一聚合：
+  // - runtime service 提供的 session / graph state
+  // - 当前 workspace 的文件树和文件内容
+  // - replay / delegation 面板状态
+  // - terminal backend 最近的命令历史
+  //
+  // 最终输出一份 IdeShellState，再交给 render 层变成 HTML。
   const sessions = await service.listSessionsByWorkspacePath(input.workspacePath);
   const selectedSession = sessions.find((session) => session.id === input.selectedSessionId) ?? sessions[0];
   const terminalEntries = options.terminal
@@ -983,6 +1001,14 @@ function renderTerminalSection(state: IdeShellState): string {
 }
 
 function renderWorkbenchPanel(state: IdeShellState): string {
+  // workbench 是当前 UI 里最接近“真正 agent IDE”的主工作区。
+  // 它把三类高频操作收进同一屏：
+  // - Conversation：跟 agent 连续对话
+  // - Explorer + Editor：看文件、改文件
+  // - Terminal：在当前 workspace 跑命令
+  //
+  // 这也是为什么这里不再把 messages/files 做成彼此独立的主 tab：
+  // agent IDE 的高频行为，本来就要求这三块能并排工作。
   return `
     <section class="panel workbench-panel${state.conversationPane === "collapsed" ? " is-conversation-collapsed" : ""}${state.terminalPane === "collapsed" ? " is-terminal-collapsed" : ""}">
       <div class="panel-header">

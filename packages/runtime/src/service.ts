@@ -323,6 +323,12 @@ export class GoalDrivenRuntimeService {
   }
 
   async createSession(input: CreateSessionInput): Promise<Session> {
+    // createSession 是所有“对话入口”的起点。
+    // 不管是 UI 新建 session、smoke 脚本直接建 session，还是后续派生 child session，
+    // 最终都要落成一个持久化的 Session 实体。
+    //
+    // 这里先 ensureWorkspace，再 createSessionRecord，目的是把“工作区存在”这个前提收成强约束。
+    // 后面只要你看到某个 session，就能确定它一定挂在一个已知 workspace 上。
     const workspace = await this.ensureWorkspace({
       path: input.workspacePath,
       label: input.workspaceLabel,
@@ -407,6 +413,13 @@ export class GoalDrivenRuntimeService {
   }
 
   async createGoal(input: CreateGoalInput): Promise<Goal> {
+    // goal 是 goal-driven runtime 的锚点。
+    // 这里不是“顺便存一条标题”，而是：
+    // - 在 session 下创建独立 Goal 实体
+    // - 把 success criteria 一起固化
+    // - 同步把 session.activeGoalId 指向新 goal
+    //
+    // 这样后面 plan / task / review 才有稳定回指，不会退化成聊天历史里的松散意图。
     const session = await this.requireSession(input.sessionId);
     const now = this.options.now();
 
@@ -428,6 +441,10 @@ export class GoalDrivenRuntimeService {
   }
 
   async savePlan(input: SavePlanInput): Promise<Plan> {
+    // savePlan 的职责是把“模型/规划器输出的一次计划草案”沉淀成持久化 Plan。
+    // 这里有两个关键点：
+    // 1. plan 一定依附 active goal，避免出现“有计划但不知道是为谁服务”
+    // 2. step.id 在这里就被稳定下来，后面 executor 更新任务或 UI 显示步骤时才有可追踪标识
     const session = await this.requireSession(input.sessionId);
     const goalId = input.goalId ?? session.activeGoalId;
 
@@ -459,6 +476,13 @@ export class GoalDrivenRuntimeService {
   }
 
   async syncTasks(input: SyncTasksInput): Promise<Task[]> {
+    // syncTasks 负责把 execute 阶段产生的任务账本落库。
+    // 它和 savePlan 的区别是：
+    // - plan 更像“意图和步骤”
+    // - task 更像“执行中的进度账本”
+    //
+    // 一个很关键的设计点是：task 会显式记录 ownerAgent。
+    // 这样同一个 session 里主 agent 和 subagent 的工作边界才可追溯。
     const session = await this.requireSession(input.sessionId);
     const goalId = input.goalId ?? session.activeGoalId;
 
@@ -486,6 +510,11 @@ export class GoalDrivenRuntimeService {
   }
 
   async recordMemory(input: RecordMemoryInput): Promise<MemoryRecord> {
+    // memory 单独建表，而不是混在 message 里。
+    // 这里的取舍是：message 用来记录交互过程，memory 用来记录“可复用的稳定事实”。
+    // 读这个函数时，可以特别注意 workspaceId/sessionId 的推导关系：
+    // - session memory 依附当前 session
+    // - workspace memory 可以跨 session 复用
     const session = input.sessionId ? await this.requireSession(input.sessionId) : null;
     const workspaceId = input.workspaceId ?? session?.workspaceId;
 
@@ -526,6 +555,8 @@ export class GoalDrivenRuntimeService {
   }
 
   async appendMessage(input: AppendMessageInput): Promise<GraphMessage> {
+    // message 虽然看起来简单，但它其实是很多上层能力的公共证据源。
+    // buildGraphState、activity log、browser workbench、trace 回放，都会用到这里留下的消息。
     await this.requireSession(input.sessionId);
     const message: GraphMessage = {
       id: this.options.createId("message"),
@@ -575,6 +606,15 @@ export class GoalDrivenRuntimeService {
   }
 
   async delegateToSubagent(input: DelegateToSubagentInput): Promise<DelegateToSubagentResult> {
+    // 这是 parent -> child delegation 的主入口。
+    // 顺着这里往下读，你能看到 subagent 在这个项目里不是“换个 prompt 角色继续聊”，而是：
+    // 1. 真实创建 child session
+    // 2. 可选继承 active goal
+    // 3. 创建 subagent run 记录
+    // 4. 把 delegation 上下文写入 child session
+    // 5. 把 parent task 标成 in_progress
+    //
+    // 也就是说，subagent 在这里是一个独立执行单元，而不是父上下文里的一次假装切换。
     const { childSession, childGoal } = await this.createChildSession({
       parentSessionId: input.parentSessionId,
       title: input.title,
@@ -625,6 +665,16 @@ export class GoalDrivenRuntimeService {
   }
 
   async completeSubagentRun(input: CompleteSubagentRunInput): Promise<CompleteSubagentRunResult> {
+    // completeSubagentRun 不是简单地把一条 run 状态改成 completed。
+    // 它同时负责：
+    // - 更新 child session summary
+    // - 更新 child goal 状态
+    // - 把结果回写到 parent task
+    // - 给 parent session 追加 delegation outcome message
+    // - 按策略归档 child session
+    //
+    // 如果没有这层“结果吸收”，subagent 运行完之后父会话只会知道“它跑过”，
+    // 却不知道“它到底产出了什么”。
     const run = await this.requireSubagentRun(input.id);
     const childSession = await this.requireSession(run.childSessionId);
     const now = this.options.now();
@@ -749,6 +799,17 @@ export class GoalDrivenRuntimeService {
   }
 
   async buildGraphState(sessionId: string): Promise<AgentGraphState | null> {
+    // buildGraphState 是 runtime 的状态装配点。
+    // LangGraph、MiniMax hooks、IDE shell 都不直接各查各的表，而是尽量从这里拿“当前 session 的执行快照”。
+    //
+    // 这一步会把：
+    // - session / activeGoal / currentPlan
+    // - tasks / messages / checkpoints / toolInvocations
+    // - session + workspace memory
+    // - subagentRuns
+    // 一次性拼成 AgentGraphState。
+    //
+    // 这个函数很适合拿来理解“系统到底认定哪些状态会影响执行”。
     const session = await this.requireSession(sessionId);
     if (!session.activeGoalId) {
       return null;
@@ -875,6 +936,14 @@ export class GoalDrivenRuntimeService {
   }
 
   async getParentTaskExecutionTrace(parentTaskId: string): Promise<ParentTaskExecutionTrace> {
+    // 这里是“主任务视角”的 trace 聚合器。
+    // 如果你想追一个复杂任务为什么没做完，通常不会只看 parent task 本身，
+    // 还需要同时看到：
+    // - parent 直接调用了哪些工具
+    // - 委托了哪些 child run
+    // - 每个 child run 里面又做了什么
+    //
+    // 这个方法把这些证据汇成一条链，方便 UI 和排错工具直接消费。
     const parentTask = await this.requireTask(parentTaskId);
     const parentSession = await this.requireSession(parentTask.sessionId);
     const [sessionToolInvocations, parentRuns] = await Promise.all([

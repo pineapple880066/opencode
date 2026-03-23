@@ -98,6 +98,9 @@ export function parseIdeShellNavigation(
 export function parseIdeShellActionDataset(
   dataset: Record<string, string | undefined>,
 ): IdeShellAction | null {
+  // 这一步负责把 DOM 上的 data-action/data-* 转成稳定的领域动作。
+  // 这样浏览器层不会直接依赖某个具体按钮长什么样，而是始终围绕
+  // “focus-panel / open-file / toggle-terminal-pane” 这类显式动作来运转。
   switch (dataset.action) {
     case "focus-panel":
       return isIdePanelId(dataset.panel)
@@ -198,6 +201,9 @@ function buildBrowserRuntimeScript(): string {
   }
 
   async function readApiPayload(response) {
+    // 浏览器端不能假设后端永远返回 JSON。
+    // 这层 helper 的作用是：先按 content-type 判断，再尽量把错误信息稳定抽出来。
+    // 这样 IDE 失败时，前端不会因为二次 parse 错误把真实异常吃掉。
     const rawText = await response.text();
     const contentType = response.headers.get("content-type") || "";
 
@@ -385,6 +391,9 @@ function buildBrowserRuntimeScript(): string {
   }
 
   async function submitPrompt(form) {
+    // submitPrompt 不直接在浏览器里拼接下一条消息，而是把 prompt 发给服务端，
+    // 再让服务端返回“下一次导航应该去哪”。
+    // 这是当前 server-driven workbench 的核心约定。
     const formData = new FormData(form);
     const prompt = String(formData.get("prompt") || "").trim();
     const workspacePath = String(formData.get("workspacePath") || "").trim();
@@ -627,6 +636,12 @@ export function renderIdeShellBrowserDocument(
   state: IdeShellState,
   navigation: IdeShellNavigationInput,
 ): string {
+  // 这一步把三样东西塞回同一份 HTML：
+  // 1. 当前 navigation
+  // 2. 当前 shell state
+  // 3. 最小浏览器运行时脚本
+  //
+  // 这样浏览器刷新、回退、点击 data-action 时，都能重新基于同一份状态协议工作。
   const runtimeMarkup = `
     <script id="${NAVIGATION_SCRIPT_ID}" type="application/json">${safeJsonForHtml(navigation)}</script>
     <script id="${STATE_SCRIPT_ID}" type="application/json">${safeJsonForHtml(state)}</script>

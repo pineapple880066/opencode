@@ -18,6 +18,7 @@
 - 当前浏览器工作台已经支持提交 prompt，并在同一 session 上走 LangGraph / runtime，而不是只能看记录
 - 当前浏览器工作台已经支持浏览当前 workspace 文件列表，并在主工作区里直接编辑、保存文本文件，不再只有会话记录和只读预览
 - 当前浏览器工作台已经补上最小可用的终端命令面板：可以在当前 workspace 内执行命令，并把最近的 stdout / stderr 历史保留在工作区里
+- 仓库这轮新增了 `docs/project-deep-dive.md`，并给 `bootstrap / service / langgraph / minimax / server / browser / shell` 这些关键文件补了面向自学的中文注释，方便暂停功能迭代时反向吃透实现链路
 - 当前浏览器工作台这轮又做了一次 `UI 稳定性修复`：workbench 改成固定区域 + 内部滚动，避免 workspace explorer 把整页撑长，也避免编辑区和终端区继续互相重叠
 - 当前浏览器工作台已经把左侧 `agent` 区和右下 `terminal` 区做成可开关面板，而且开关状态已经进入 server-driven 导航协议；这意味着刷新页面、切换 session、提交 prompt / 保存文件 / 运行命令之后，工作区布局不会乱跳
 - LangGraph 的 `execute` 节点已经接入最小真实工具循环：模型可以返回 `toolCalls`，runtime 会真实执行 `list / view / grep / write / edit`，再把工具结果回写到消息和 tool invocation 日志里
@@ -188,6 +189,7 @@
 - `docs/agent-architecture.md`
 - `docs/agent-definition-of-done.md`
 - `docs/reading-guide.md`
+- `docs/project-deep-dive.md`
 - `docs/interview-notes.md`
 - `docs/local-infra.md`
 - `.codex/skills/agent-self-check/SKILL.md`

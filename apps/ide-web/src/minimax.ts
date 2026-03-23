@@ -438,6 +438,18 @@ function sanitizeExecutorCandidate(value: unknown, state?: AgentGraphState): unk
     return value;
   }
 
+  // executor sanitizer 是这层适配器里最关键的一步。
+  // 模型返回的 JSON 就算“看起来像对”，也可能有几个常见问题：
+  // - task 只有 id/status，没有 title/inputSummary
+  // - memory key 有了，但 value 是空的
+  // - toolCalls 里 name 合法，但 input 不是 object
+  //
+  // 这里的策略不是盲信模型，而是：
+  // 1. 能从现有 state 补全的字段尽量补全
+  // 2. 补不齐的脏项直接丢弃
+  // 3. 最后再交给 Zod schema 做强校验
+  //
+  // 这样做的效果是：结构化输出链不会因为一两个半残字段就整体崩掉。
   const tasks = Array.isArray(value.tasks)
     ? value.tasks
         .map((task) => sanitizeExecutorTaskCandidate(task, state))
@@ -936,6 +948,19 @@ async function callMiniMaxJson<T>(
   schema: z.ZodType<T>,
   options?: MiniMaxJsonCallOptions,
 ): Promise<T> {
+  // callMiniMaxJson 是 provider 适配层最核心的“防脏数据入口”。
+  // 它负责把一次模型输出收成三层处理：
+  // 1. 先做 JSON 提取与 parse
+  // 2. parse 都过不了时，先走一次 syntax repair
+  // 3. parse 过了但 schema 不合法时，再走 sanitizer + Zod + schema repair
+  //
+  // 这层不能只靠 prompt，因为真实模型输出经常会出现：
+  // - 语法级 JSON 损坏
+  // - 枚举值漂移
+  // - 数组超长
+  // - 必填字段缺失
+  //
+  // 这里的设计目标不是“让模型绝不犯错”，而是把 provider 不稳定性尽量消化在适配层。
   const content = await requestMiniMaxContent(config, fetchImpl, [
     {
       role: "system",
@@ -1167,6 +1192,14 @@ export function createMiniMaxHooks(options?: MiniMaxHooksOptions): LangGraphHook
       };
     },
     executor: async (state, input): Promise<LangGraphExecuteResult | null> =>
+      // executor hook 是 MiniMax 与 runtime execute control loop 的接缝。
+      // 读这里时要重点看三件事：
+      // 1. prompt 里如何约束 executionPhase / toolCalls / reread policy
+      // 2. sanitizer 如何把“脏但可修”的 JSON 收口
+      // 3. 为什么它只输出结构化结果，而不直接动文件
+      //
+      // 真正的文件修改仍然发生在 runtime 的 toolExecutor 里，
+      // 这里的职责只是：基于当前 state，提出下一步执行草案。
       callMiniMaxJson(
         config,
         fetchImpl,

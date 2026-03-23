@@ -447,6 +447,12 @@ export function createAgentLangGraph(
   const toolExecutor = options.toolExecutor;
 
   const intakeNode = async (state: AgentLangGraphState): Promise<AgentLangGraphUpdate> => {
+    // intake 是 graph 的入口。
+    // 它负责把外部输入先稳定落到系统里：
+    // - 用户消息先入 message ledger
+    // - 如果当前 session 还没有 active goal，再尝试调用 goalFactory 生成第一个 goal
+    //
+    // 所以后面 plan/execute 能否运行，前提通常都在这里建立。
     if (state.userMessage) {
       await service.appendMessage({
         sessionId: state.sessionId,
@@ -492,6 +498,9 @@ export function createAgentLangGraph(
   };
 
   const planNode = async (state: AgentLangGraphState): Promise<AgentLangGraphUpdate> => {
+    // planNode 的职责很单纯：把 planner hook 的结构化输出，变成真正持久化的 Plan。
+    // 这里不自己“猜计划怎么生成”，而是把业务动作下沉给 service.savePlan。
+    // 这样 graph 只管编排顺序，plan 的真正生命周期则统一走应用服务层。
     if (!state.runtimeState) {
       return {
         executionLog: logLine("plan", "当前 session 没有 active goal，跳过 plan"),
@@ -530,6 +539,12 @@ export function createAgentLangGraph(
   };
 
   const delegateNode = async (state: AgentLangGraphState): Promise<AgentLangGraphUpdate> => {
+    // delegateNode 是 parent session 决定“要不要派生 child session”的地方。
+    // 这里的关键点不是让模型说一句“需要子代理”，而是把这个判断落实成：
+    // - child session
+    // - subagent run
+    // - latestSubagentRunId
+    // - checkpoint / executionLog
     if (!state.runtimeState) {
       return {
         executionLog: logLine("delegate", "当前 session 没有 active goal，跳过 delegation"),
@@ -568,6 +583,16 @@ export function createAgentLangGraph(
   };
 
   const executeNode = async (state: AgentLangGraphState): Promise<AgentLangGraphUpdate> => {
+    // executeNode 是整个 runtime 最复杂的一段。
+    // 可以把它理解成一个受约束的 tool-use control loop：
+    // 1. 调 executor hook，让模型给出结构化执行草案
+    // 2. 同步 tasks / memory
+    // 3. 如果有 toolCalls，就真实调用工具
+    // 4. 把工具结果写回消息和 invocation ledger
+    // 5. 再把新的 runtimeState 喂给下一轮 executor
+    //
+    // 这段代码的核心价值，不是“让模型多跑几轮”，而是把“什么时候该继续读、什么时候该改、什么时候该收尾”
+    // 从纯 prompt 约束，推进成执行层的真实纪律。
     if (!state.runtimeState) {
       return {
         executionLog: logLine("execute", "当前 session 没有 active goal，跳过 execute"),
@@ -798,6 +823,14 @@ export function createAgentLangGraph(
   };
 
   const reviewNode = async (state: AgentLangGraphState): Promise<AgentLangGraphUpdate> => {
+    // reviewNode 负责把“这次执行到底算不算达成 goal”明确化。
+    // 这一步不等于总结。它更像一次结构化判定：
+    // - satisfied?
+    // - 为什么 satisfied / 不 satisfied?
+    // - 剩余风险是什么?
+    // - 下一步建议是什么?
+    //
+    // 这也是为什么 goal-driven workflow 不能只停在 todo list：没有 review，就没有真正的闭环。
     if (!state.runtimeState) {
       return {
         executionLog: logLine("review", "当前 session 没有 active goal，跳过 review"),
@@ -838,6 +871,9 @@ export function createAgentLangGraph(
   };
 
   const summarizeNode = async (state: AgentLangGraphState): Promise<AgentLangGraphUpdate> => {
+    // summarizeNode 主要服务于“会话恢复”和“IDE 可见性”。
+    // 它把当前 goal / task / 风险收束成 session summary，
+    // 这样你下次回到这个 session 时，不需要从头翻完整消息历史。
     if (!state.runtimeState) {
       return {
         executionLog: logLine("summarize", "当前 session 没有 active goal，跳过 summarize"),
