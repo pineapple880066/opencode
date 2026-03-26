@@ -414,6 +414,79 @@
 
 也就是说，这次修复已经把问题从“执行链卡住/产不出 patch”，推进成了“patch 已能产出，但还有回归要收”。
 
+## 2026-03-26：用新 runtime 再跑 `requests-2148 / requests-2674`，确认 budget + selector 还没有真正转化成 benchmark 改善
+
+这轮我没有继续猜，而是直接用新 runtime 重跑 `psf__requests-2148 / psf__requests-2674`。
+
+先暴露出的不是 agent 问题，而是 runner 自己的一个基础设施问题：repo cache 目录一旦已经存在，`ensureRepositoryCache()` 之前会无条件执行 `git fetch --prune origin`。这在网络波动时会直接把整条实例打死，即使本地 cache 里已经有需要的 `base_commit`。这次实际就撞到了：
+
+- `LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443`
+
+所以我先把 `packages/evals/src/swebench-lite.ts` 收紧成更合理的行为：
+
+- 如果 cache 已存在，就优先尝试 `git fetch --prune origin`
+- fetch 失败时，不立刻终止，而是继续使用本地 cache
+- 只有后续 `ensureCommitAvailable()` 发现目标 `base_commit` 本地也没有时，才把实例判成真正失败
+
+这样 benchmark rerun 才真正具备“离线复现已有 cache”的能力，而不是把网络瞬时问题误判成 agent 问题。
+
+修完这个 runner 级问题后，这轮 `requests` rerun 的真实结果是：
+
+- headless runner：
+  - `psf__requests-2148`
+    - `completed`
+    - 产出 `818 bytes` patch
+    - 只改了 `requests/models.py`
+  - `psf__requests-2674`
+    - `timed_out`
+    - 5 分钟后仍停在 `invoke:start`
+    - 但工作区里已经落下 `736 bytes` patch，改了 `requests/adapters.py`
+- 运行产物：
+  - `.benchmarks/swebench-lite/runs/swebench-lite-requests-rerun-20260326T213500Z/run-report.json`
+  - `.benchmarks/swebench-lite/runs/swebench-lite-requests-rerun-20260326T213500Z/predictions.json`
+
+我随后把这版 predictions 继续送进官方 harness，结论也很明确：
+
+- `psf__requests-2148`
+  - 官方仍然 `resolved: false`
+  - 目标测试 `test_iter_content_handles_socket_error` 仍然没过
+  - 还额外打挂了两条原本应继续通过的回归：
+    - `test_custom_content_type`
+    - `test_set_cookie_on_301`
+  - 官方报告：
+    - `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-requests-rerun-20260326T213500Z/minimax:MiniMax-M2.7/psf__requests-2148/report.json`
+- `psf__requests-2674`
+  - 官方 harness 进入 `pytest -rA test_requests.py` 后，超过 12 分钟仍未生成 `report.json`
+  - 容器内可以确认测试进程仍在运行，不是容器死掉
+  - 这说明这版 patch 至少没有带来可接受的 benchmark 改善，而且很可能把评测推进到了异常慢路径
+
+更关键的是，这轮 rerun 让一个设计问题变得非常清楚：
+
+- 新加的 `budget + selector` 确实让 runtime 更保守、更安全了
+- 但它还没有把 agent 推进到正确的行为修复路径
+- 在 `requests-2148 / requests-2674` 这类题上，当前 runtime 反而容易把 agent 卡在：
+  - import 级补丁
+  - 类型名补丁
+  - 解释/总结层收尾
+
+也就是说，这轮结果不能说是 benchmark 改善；更准确的说法是：
+
+- 这次 runtime 改动提高了“不要轻易落危险 patch”的能力
+- 但还没有提高“把 patch 真正推进到正确行为修改”的能力
+
+所以下一步不应该继续泛化地堆更多 selector 提示，而应该更具体地补：
+
+1. `failing test -> target function/path` 的语义锚定
+   - 例如 `test_iter_content_handles_socket_error` 必须逼 runtime 最终命中 `iter_content` / `generate`
+2. 行为修复任务的“实质性 edit”门槛
+   - import/comment 级 patch 不能算 modify 完成
+3. 当目标路径已经定位明确时，允许最小必要行为 patch 落盘，而不是让 budget 过早把 agent困在表层改动里
+
+这轮最重要的结论不是“又失败了”，而是：
+
+- 我已经有了很清楚的反证，说明当前这版 runtime gate 还不够好
+- benchmark 现在不是黑盒了，后续可以围绕这个反证继续精修控制环
+
 ## 现在最应该继续做什么
 
 按优先级排序：
@@ -490,3 +563,378 @@
 - 用代码 gate 决定什么时候还不能 finalize
 
 但这仍然不代表整体项目完成。DoD 里的 `memory / multi-session / subagent / planning mode / goal-driven workflow` 仍然整体是“部分完成”，不是全部关闭。
+
+## 2026-03-26：把 `2148/2674` 暴露出的两条 gate 继续下沉到 runtime
+
+这次继续做的不是 benchmark prompt，而是 `execute control loop` 自身：
+
+1. `行为修复必须命中目标代码路径或目标函数体`
+   - verification requirement 现在除了测试目标，还会收集：
+     - `targetCodePaths`
+     - `targetBehaviorAnchors`
+   - 如果任务已经进入行为修复阶段，但最新 `edit/write` 仍然只是 import/comment 级补丁，或者没有命中目标路径/函数体，runtime 会追加 `MODIFICATION_POLICY`，强制下一轮继续 modify
+2. `共享热路径上的表层补丁不能长期占住 modify phase`
+   - `sharedHotModifiedPaths` 和 `superficialBehaviorPaths` 现在分开建模
+   - 这样像 `adapters.py` 上的 import-only patch，即使不属于 substantial high-risk rewrite，也会被识别成“共享热路径上的表层补丁”
+   - runtime 会明确追加提示：不能让这类补丁长期占住 modify phase
+3. `主目标验证通过后，仍可继续要求回到目标路径或继续补验证`
+   - 这次把“失败后回到目标代码路径继续改”的提示做成了显式分支
+   - 同时把高风险共享路径上 “targeted verify 通过，但仍缺少 adjacent regression” 也单独拉成了 runtime 分支，而不只依赖通用的 stronger verification 提示
+
+对应代码：
+
+- `packages/runtime/src/langgraph.ts`
+  - `extractBehaviorTargetAnchorsFromText()`：从用户请求和测试选择器里抽目标行为锚点
+  - `writeLikeToolCallTargetsBehavior()`：判断某次 write-like edit 是否真的命中了目标行为路径
+  - `executeNode`：
+    - `shouldForceTargetBehaviorHit`
+    - `shouldForceReturnToTargetPathAfterFailedVerification`
+    - `shouldForceAdjacentRegressionAfterTargetedVerify`
+  - `sharedHotModifiedPaths`：把“共享热路径”从 `highRisk=substantial rewrite` 里拆出来单独追踪
+- `packages/runtime/src/langgraph.test.ts`
+  - `行为性任务里，只有 import/comment 级补丁时不能 finalize，必须继续命中真实行为路径`
+  - `高风险共享路径上的 import 级表层补丁不能长期占住 modify phase`
+  - `高风险共享路径上的过宽 edit 会先被 budget guard 拦下，并至少推进到目标验证阶段`
+
+验证证据：
+
+- `pnpm typecheck`
+- `pnpm exec tsx --test packages/runtime/src/langgraph.test.ts`
+- 当前 `AgentLangGraphRuntime` 场景集 `15/15` 通过
+
+这一步推进的是 runtime gate 和场景测试，不是 benchmark 结果本身。`2148 / 2674` 是否因此真正改善，还要再回到 headless runner 和官方 harness 里验证。项目整体 DoD 状态没有变化：`memory / multi-session / subagent / planning mode / goal-driven workflow` 仍然整体是部分完成。
+
+## 2026-03-26：用这版 runtime 重跑完整 5 条 SWE-bench Lite，确认 headless 已经 `5/5` 产 patch，但官方结果仍停在 `3/5`
+
+这轮我没有再只看 `2148 / 2674`，而是把当前这版 runtime 重新放回原始 5 条实例里做整批回归：
+
+- `pallets__flask-4045`
+- `pallets__flask-4992`
+- `psf__requests-2148`
+- `psf__requests-2674`
+- `pytest-dev__pytest-5227`
+
+先看 headless runner，这轮产物在：
+
+- `.benchmarks/swebench-lite/runs/swebench-lite-five-rerun-20260326T230500Z/run-report.json`
+- `.benchmarks/swebench-lite/runs/swebench-lite-five-rerun-20260326T230500Z/predictions.json`
+
+结果是：
+
+- `completed=5`
+- `failed=0`
+- `timedOut=0`
+- `withPatch=5`
+
+而且 5 条实例都已经不是空 patch：
+
+- `pallets__flask-4045`
+  - `1345 bytes`
+  - 改 `src/flask/blueprints.py`
+- `pallets__flask-4992`
+  - `1210 bytes`
+  - 改 `src/flask/config.py`
+- `psf__requests-2148`
+  - `818 bytes`
+  - 改 `requests/models.py`
+- `psf__requests-2674`
+  - `630 bytes`
+  - 改 `requests/adapters.py`
+- `pytest-dev__pytest-5227`
+  - `514 bytes`
+  - 改 `src/_pytest/logging.py`
+
+这说明一个事实：
+
+- 这版 runtime 已经把 benchmark runner 的“黑盒超时 / 产不出 patch”阶段基本跨过去了
+- 至少在同一批 5 条实例上，headless patch 产出链已经稳定到 `5/5`
+
+但真正关键的是官方 harness 结果。这轮整批官方结果在：
+
+- `Desktop/benchmarks/SWE-bench/minimax:MiniMax-M2.7.opencode-five-rerun-20260326T230500Z.json`
+
+结果仍然是：
+
+- `resolved_instances=3`
+- `unresolved_instances=2`
+- `empty_patch_instances=0`
+- `error_instances=0`
+
+resolve 的仍然是：
+
+- `pallets__flask-4045`
+- `pallets__flask-4992`
+- `pytest-dev__pytest-5227`
+
+unresolved 的仍然是：
+
+- `psf__requests-2148`
+- `psf__requests-2674`
+
+也就是说，这轮整批 benchmark 的 top-line 没有改善，仍然是 `3/5`。但新证据很有价值，因为它把问题进一步收窄成：
+
+- 现在不是“产不出 patch”
+- 而是 `requests` 两条实例仍然落在**表层补丁**上，没有真正推进到行为路径修复
+
+`2148` 的官方报告和 patch：
+
+- `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-five-rerun-20260326T230500Z/minimax:MiniMax-M2.7/psf__requests-2148/report.json`
+- `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-five-rerun-20260326T230500Z/minimax:MiniMax-M2.7/psf__requests-2148/patch.diff`
+
+这次它的真实状态是：
+
+- patch 已能 apply
+- `FAIL_TO_PASS` 里过了 `8` 条
+- 还剩 `2` 条没过：
+  - `test_HTTP_200_OK_HEAD`
+  - `test_iter_content_handles_socket_error`
+- patch 仍然只是在 `requests/models.py` 顶部加：
+  - `import socket`
+  - `import ConnectionError`
+
+这说明当前所谓“行为修复必须命中目标函数体”的 gate，还没有真正在 benchmark 里把 agent 拉回 `iter_content / generate` 那条函数路径。
+
+`2674` 的官方报告和 patch：
+
+- `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-five-rerun-20260326T230500Z/minimax:MiniMax-M2.7/psf__requests-2674/report.json`
+- `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-five-rerun-20260326T230500Z/minimax:MiniMax-M2.7/psf__requests-2674/patch.diff`
+
+这次它的真实状态是：
+
+- `FAIL_TO_PASS = 0 failure`
+- 但 `PASS_TO_PASS` 仍有 `4` 条回归：
+  - `test_connection_error_invalid_domain`
+  - `test_connection_error_invalid_port`
+  - `test_connect_timeout`
+  - `test_total_timeout_connect`
+- patch 仍然只是在 `requests/adapters.py` 里补：
+  - `from .packages.urllib3.exceptions import ClosedPoolError`
+
+这说明当前“共享热路径不能长期停在表层补丁”这条 runtime gate，虽然让系统更保守了，但还没强到能把 agent 从 import-only 假推进里真正拉出来。
+
+所以这轮最重要的结论不是“又是 3/5”，而是：
+
+- headless patch 产出已经稳定
+- 官方 harness 结果也稳定复现
+- 失败已经不再是黑盒
+- 当前瓶颈可以非常明确地定义成：
+  - `2148`：目标路径命中 gate 还不够强，import 级补丁仍会混进 modify
+  - `2674`：共享热路径表层补丁 gate 还不够强，agent 仍会在 import-only patch 上假推进
+
+这比单纯再堆 benchmark prompt 更有价值，因为它直接告诉我下一轮 runtime 应该继续补哪一层：
+
+1. 把 failing tests 结构化反馈和目标代码路径的绑定做得更硬
+2. 让 import/comment-only patch 根本不能被记成一次有效 modify
+3. 对共享热路径，把“必须命中行为分支或异常映射”从提示变成更硬的 gate
+
+## 2026-03-26：把 verify 失败从“原始文本回流”推进到“结构化失败解析 + 目标代码路径回跳”
+
+这轮推进的是 `execute control loop` 的 feedback loop，不是 benchmark prompt。
+
+之前的状态是：
+
+- agent 已经会在 `verify phase` 请求 `bash`
+- runtime 也已经会看 `exitCode`
+- 失败后会阻止 `finalize`
+
+但失败反馈本质上还是：
+
+- 原始 `stdout/stderr`
+- 通用的 `VERIFICATION_POLICY / MODIFICATION_POLICY`
+
+这意味着下一轮 modify 主要还在靠模型自己从长文本里猜：
+
+- 哪条测试失败了
+- traceback 指到了哪个代码路径
+- 具体该回到哪个函数体继续改
+
+这轮我把这层下沉到了 runtime：
+
+1. 结构化解析 verify 失败输出
+   - 直接从 `bash` 输出里抽：
+     - `failingTests`
+     - `targetCodePaths`
+     - `targetBehaviorAnchors`
+     - `assertionHints`
+   - 代码在：
+     - `packages/runtime/src/langgraph.ts`
+       - `readBashOutputText()`
+       - `extractFailingTestsFromOutput()`
+       - `extractTraceAnchorsFromOutput()`
+       - `extractAssertionHintsFromOutput()`
+       - `parseVerificationFailureFeedback()`
+2. 把结构化失败信号写回 message ledger
+   - 每次 verify 失败后，runtime 会追加一条 `VERIFICATION_FEEDBACK` system message
+   - 这条消息不再只是“最近验证失败了”，而是明确写出：
+     - 失败测试
+     - 目标代码路径
+     - 目标行为锚点
+     - 断言/异常线索
+3. 把这些信号并回 verification requirement
+   - `buildVerificationRequirement(...)` 现在会吃到 `latestVerificationFailure`
+   - 这样下一轮 gate 不再只靠用户原始请求里的测试名或文件名，而会直接吸收最近一次失败留下的结构化证据
+4. provider 侧也同步收紧
+   - `apps/ide-web/src/minimax.ts` 的 executor prompt 里新增：
+     - 如果最近消息里出现 `VERIFICATION_FEEDBACK`
+     - 下一轮必须优先围绕这些信号继续 `modify/verify`
+     - 不能回头读无关文件
+
+这轮最关键的行为变化不是“验证失败后多写了一句提示”，而是：
+
+- runtime 现在已经能把失败测试和 traceback 主动压缩成可执行线索
+- 下一轮 `shouldForceReturnToTargetPathAfterFailedVerification` 这类 gate 会直接吃这些线索
+- 所以 feedback loop 已经从“文本级回流”推进到了“结构化失败解析 + 更强目标路径回跳”
+
+验证证据：
+
+- `pnpm typecheck`
+- `pnpm exec tsx --test packages/runtime/src/langgraph.test.ts`
+- 当前 `AgentLangGraphRuntime` 场景集 `16/16` 通过
+- 新增场景：
+  - `verify 失败后会生成结构化失败反馈，并把下一轮 modify 拉回目标代码路径`
+
+边界也要说清楚：
+
+- 这一步已经是 runtime 代码强制执行，不是只写在 prompt 里
+- 但它还不是成熟的测试失败 AST 分析器
+- 当前结构化解析主要覆盖：
+  - failing tests
+  - traceback 路径
+  - 行为锚点
+  - assertion / exception hints
+- 这一步还没有重新拿 `2148 / 2674` 做 benchmark 证据回归，所以不能直接说 benchmark 分数已经因此改善
+
+## 2026-03-26：把 `2148/2674` 暴露出的两类假推进收成更硬的 runtime modify gate
+
+这轮继续改的是 `execute control loop`，不是 benchmark prompt。
+
+前面的整批 5 条 rerun 已经把问题暴露得很清楚：
+
+- `psf__requests-2148` 的 patch 还能退化成只补 import，说明“命中目标函数体/异常路径”这条 gate 还不够硬
+- `psf__requests-2674` 的 patch 还能在共享热路径上长期停留在 import-only 表层补丁，说明“共享热路径上的表层补丁不算有效 modify”这条 gate 还不够硬
+
+所以这轮没有继续调 prompt，而是把这两个 failure class 收进了 runtime。
+
+### 1. 工具合同先补齐 benchmark 真实输出风格
+
+`packages/tools/src/builtin.ts`
+
+- `edit` 现在继续兼容 benchmark 风格的小写别名：
+  - `searchreplace`
+  - `oldtext`
+  - `newcontent`
+  - `newtext`
+
+这一步不是直接提分，而是先把“模型已经准备 edit，但工具合同不认参数”的阻抗消掉。
+
+### 2. 对 `2148`：行为修复必须真的命中目标函数体/异常路径
+
+`packages/runtime/src/langgraph.ts`
+
+这轮新增了一个更硬的判断：
+
+- 如果当前任务是行为性修复
+- 并且 runtime 已经知道：
+  - `targetCodePaths`
+  - `targetBehaviorAnchors`
+- 那么只在目标文件上做 import/comment/表层整理，不再算一次有效 modify
+
+具体做法是：
+
+- 新增 `writeLikeToolCallIsSuperficialBehaviorPatch(...)`
+- 如果某次 `edit/write` 只是：
+  - import 补丁
+  - comment 补丁
+  - 没有命中真实函数体/行为路径
+- runtime 会在真正执行工具前直接拦下，并追加 `MODIFICATION_POLICY`
+
+这一步的意义是：
+
+- `2148` 这类题里，agent 不能再靠“补了 `socket` / `ConnectionError` import”冒充进入 modify
+- runtime 会逼它继续改到真正的行为路径
+
+### 3. 对 `2148`：共享热路径上的局部行为补丁不再被 budget guard 误杀
+
+之前一个实际问题是：
+
+- 共享热路径上的 try/except 局部补丁
+- 可能会被误判成“宽范围控制流/异常映射重写”
+- 导致 runtime 在 edit 执行前就把它打掉
+
+这会让 agent 被夹在两个坏结果之间：
+
+- 不敢做真正局部行为修复
+- 只能退回 import-only 表层补丁
+
+所以这轮我把 `explainModificationBudgetViolation(...)` 调整成：
+
+- 如果 patch 确实命中目标行为
+- 且改动范围还在局部预算内
+- 就不会仅仅因为存在 try/except / 异常映射结构而被判成必拦的大改
+
+这一步是为了把 `2148` 从“表层补丁”和“过宽拦截”两种坏结果里拉出来。
+
+### 4. 对 `2674`：共享热路径上的 import-only 补丁不能长期占住 modify phase
+
+`packages/runtime/src/langgraph.ts`
+
+这轮把一件事讲得更清楚了：
+
+- `sharedHotPath`
+- `highRisk rewrite`
+
+这两个概念不是一回事。
+
+之前如果只按“大改动/宽改动”来抓高风险，很容易漏掉一种 benchmark 里特别常见的假推进：
+
+- 文件路径本身就是共享热路径
+- 但 patch 只是 import-only
+- 看起来像已经进入 modify
+- 实际没有碰到行为分支
+
+所以现在 runtime 的规则是：
+
+- 共享热路径上的 import/comment 级表层补丁
+- 即使不是“大改”
+- 也不能被当成有效 modify 长期占住 modify phase
+
+换句话说：
+
+- `2674` 这类题里
+- agent 不能靠补一个 `ClosedPoolError` import 就继续往后 summarize/finalize
+
+### 5. focused 验证
+
+这轮没有先重跑 benchmark，而是先做 focused runtime 验证：
+
+- `pnpm typecheck`
+- `pnpm exec tsx --test packages/runtime/src/tooling.test.ts`
+- `pnpm exec tsx --test packages/runtime/src/langgraph.test.ts`
+
+结果：
+
+- `tooling.test.ts` 通过
+- `langgraph.test.ts` 当前 `16/16` 通过
+
+新增/更新的关键场景包括：
+
+- `行为性任务里，只有 import/comment 级补丁时不能 finalize，必须继续命中真实行为路径`
+- `高风险共享路径上的 import 级表层补丁不能长期占住 modify phase`
+
+### 6. 这轮完成了什么，没完成什么
+
+这轮完成的是：
+
+- runtime gate 已实现并验证
+- 工具合同对 benchmark edit 参数的兼容更完整
+- 行为修复与共享热路径的两类假推进，都被下沉到了控制环
+
+这轮没有完成的是：
+
+- 还没有重新拿这版 runtime 去做 `2148 / 2674` 的 benchmark 证据回归
+- 所以还不能说 SWE-bench 分数已经因此改善
+
+最准确的表述应该是：
+
+- 这轮完成的是 runtime 本体能力增强
+- benchmark 是否提分，仍然需要后续实例回归证明

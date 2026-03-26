@@ -1656,6 +1656,241 @@
 - 我没有直接在 runtime 里替模型执行这些命令，而是先把它做成显式建议，这样保留了 provider 层的灵活性
 - 但我也不再满足于“只写文件名提示”，因为那样对 verify phase 的约束仍然太弱
 
+### 亮点 17：我会用 benchmark 反证推翻自己的 runtime 策略，而不是把新 gate 当成真理
+
+你可以说：
+
+“我后来专门把新 runtime 再拿去重跑了 `requests-2148 / requests-2674`，目的不是证明自己这版策略多厉害，而是验证它到底有没有把 benchmark 结果真正往前推。结果很直接：`2148` 虽然能跑完并产出 patch，但官方 harness 仍然判 unresolved，而且还新增了两条回归；`2674` 在 headless runner 里会超时，但工作区会留下 patch，送进官方 harness 以后又在 `pytest -rA test_requests.py` 阶段异常变慢，十几分钟还没有 report。这个结果说明我这版 `budget + selector` 提高了安全性，却没有真正把 agent 推到正确的行为修复路径上。工程上我会把这类结果记成反证，而不是继续自我感觉良好地堆 prompt。”
+
+代码证据：
+
+- `packages/evals/src/swebench-lite.ts`
+  - `ensureRepositoryCache()`：repo cache 已存在时，`git fetch` 失败不再立刻打死实例，而是优先复用本地 cache
+  - `runSweBenchLite()`：继续用阶段日志和增量落盘保留 rerun 证据
+- 本轮 runner 结果：
+  - `.benchmarks/swebench-lite/runs/swebench-lite-requests-rerun-20260326T213500Z/run-report.json`
+  - `.benchmarks/swebench-lite/runs/swebench-lite-requests-rerun-20260326T213500Z/predictions.json`
+- `2148` 官方结果：
+  - `.benchmarks/SWE-bench/logs/run_evaluation/opencode-requests-rerun-20260326T213500Z/minimax:MiniMax-M2.7/psf__requests-2148/report.json`
+- `2674` 官方运行证据：
+  - `.benchmarks/SWE-bench/logs/run_evaluation/opencode-requests-rerun-20260326T213500Z/minimax:MiniMax-M2.7/psf__requests-2674/run_instance.log`
+
+这件事面试里最值得讲的点是：
+
+- 我没有把 runtime gate 当成一加就一定提分的“正确答案”
+- 我会重新送进 benchmark，用官方结果验证它到底是在提高 patch 质量，还是只是把 agent 卡在更保守但也更表层的补丁里
+- 这类反证会直接反过来指导下一轮 runtime 设计，比如：
+  - `failing test -> target function/path` 的更强语义锚定
+  - import/comment 级 patch 不能冒充行为修复
+  - 当目标路径已经定位明确时，要允许最小必要行为 patch 真正落盘
+
+### 亮点 18：我把 “行为修复必须命中目标函数体” 做成了 runtime gate，而不是继续靠 prompt 猜模型有没有改到点上
+
+你可以说：
+
+“`requests-2148` 这类题给我的一个明确反证是：agent 其实已经看懂了方向，甚至会补 `ConnectionError`、`socket` 这种 import，但补丁还是可能停在 import 级半成品，根本没真正改到目标行为路径。这个问题如果继续靠 prompt 提醒‘去改核心逻辑’，约束力不够，所以我把它下沉到了 runtime：verification requirement 不再只记录测试目标，还会额外抽目标代码路径和目标行为锚点；每次 `edit/write` 之后，runtime 会判断这次改动是不是只停在 import/comment 级整理，还是已经命中了目标文件里的真实函数体、条件分支或异常映射。如果没有命中，就直接发 `MODIFICATION_POLICY`，禁止 finalize，强制下一轮继续 modify。” 
+
+代码证据：
+
+- `packages/runtime/src/langgraph.ts`
+  - `extractBehaviorTargetAnchorsFromText()`：从用户请求、测试名和上下文里抽行为锚点
+  - `collectTargetCodePaths()` / `collectBehaviorTargetAnchors()`：把目标路径和锚点装进 verification requirement
+  - `writeLikeToolCallTargetsBehavior()`：判断某次 write-like edit 是否命中了目标行为
+  - `executeNode`
+    - `shouldForceTargetBehaviorHit`
+    - `shouldForceReturnToTargetPathAfterFailedVerification`
+- `packages/runtime/src/langgraph.test.ts`
+  - `行为性任务里，只有 import/comment 级补丁时不能 finalize，必须继续命中真实行为路径`
+
+这件事面试里最值得讲的点是：
+
+- 我没有把“模型应该自己知道改哪里”当成假设
+- 我把“是否真的改到了目标行为路径”变成了 runtime 可以检查的条件
+- 这类 gate 不一定直接提高 benchmark 分数，但它能把半成品 patch 更早挡在 control loop 里
+
+### 亮点 19：我把 “共享热路径上的表层补丁不能长期占住 modify phase” 从一句经验，变成了显式状态和策略
+
+你可以说：
+
+“`requests-2674` 暴露出的另一个问题是：像 `adapters.py` 这种共享热路径上，即使模型没有直接做大重写，它也可能先落一个 import-only 的表层补丁，然后一直耗在 modify phase 里，看起来像在推进，实际并没有碰到真正的行为路径。这个问题如果只用 `highRisk = substantial rewrite` 去判断，会漏掉一类很重要的假推进。所以我在 runtime 里把 `sharedHotPath` 和 `highRisk` 拆开了：前者表示它是不是共享热路径，后者才表示它是不是实质性的高风险大改。这样 runtime 就能单独识别‘共享热路径上的表层补丁’，然后明确追加策略提示：不能让这种补丁长期占住 modify phase，下一轮必须继续打到目标函数体。” 
+
+### 亮点 20：我会用“整批 benchmark 回归”验证 runtime gate 是否真的有效，而不是只看单条修好了没有
+
+你可以说：
+
+“我后来专门把这版 runtime 放回原始 5 条 SWE-bench Lite 实例里整批回归，而不是继续只盯 `2148 / 2674` 两条。因为单条实例有时会让人误以为策略有效，但整批回归更能看出这是不是 agent 本体能力的改善。这轮 headless runner 的结果其实很好，5 条实例全部稳定产出了 patch；但官方 harness 还是 `3/5 resolved`，通过的仍然是两条 Flask 加上一条 pytest，`requests-2148 / requests-2674` 依旧 unresolved。这个结果说明一件很关键的事：我现在的问题已经不是 patch 产不出来，而是 requests 这两类题仍然停在 import 级表层补丁，没有真正推进到目标行为路径。所以我不会因为 headless `5/5 withPatch` 就说 agent 变强了，我更看重的是官方 harness 上的稳定、可重复结果。” 
+
+代码证据：
+
+- 这轮 headless runner 产物：
+  - `.benchmarks/swebench-lite/runs/swebench-lite-five-rerun-20260326T230500Z/run-report.json`
+  - `.benchmarks/swebench-lite/runs/swebench-lite-five-rerun-20260326T230500Z/predictions.json`
+- 这轮官方 harness 汇总：
+  - `Desktop/benchmarks/SWE-bench/minimax:MiniMax-M2.7.opencode-five-rerun-20260326T230500Z.json`
+- 两条 requests 的官方明细：
+  - `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-five-rerun-20260326T230500Z/minimax:MiniMax-M2.7/psf__requests-2148/report.json`
+  - `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-five-rerun-20260326T230500Z/minimax:MiniMax-M2.7/psf__requests-2674/report.json`
+- 两条 requests 的 patch：
+  - `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-five-rerun-20260326T230500Z/minimax:MiniMax-M2.7/psf__requests-2148/patch.diff`
+  - `Desktop/benchmarks/SWE-bench/logs/run_evaluation/opencode-five-rerun-20260326T230500Z/minimax:MiniMax-M2.7/psf__requests-2674/patch.diff`
+
+面试里最值得强调的点：
+
+- 我不会把 `withPatch=5` 直接包装成 benchmark 提升
+- 我会区分：
+  - `patch 产出链是否稳定`
+  - `官方 harness 是否真的判 resolved`
+- 这轮整批回归给我的新结论不是“又只有 3/5”，而是：
+  - `2148` 的 patch 还是只改 import，说明“命中目标函数体”这条 gate 还不够硬
+  - `2674` 的 patch 还是只补 import，说明“共享热路径上的表层补丁不能长期占住 modify phase”这条 gate 还不够硬
+- 这就把下一轮 runtime 该补哪一层说得很清楚，而不是继续泛泛地调 prompt
+
+代码证据：
+
+- `packages/runtime/src/langgraph.ts`
+  - `WriteLikeModificationAnalysis.sharedHotPath`
+  - `pathLooksLikeHighRiskSharedCode()`
+  - `executeNode` 里的：
+    - `sharedHotModifiedPaths`
+    - `superficialBehaviorPaths`
+    - `highRiskSuperficialBehaviorPaths`
+- `packages/runtime/src/langgraph.test.ts`
+  - `高风险共享路径上的 import 级表层补丁不能长期占住 modify phase`
+
+这件事面试里最值得讲的点是：
+
+- 我不是简单把“高风险”理解成“大改动”
+- 我把“路径风险”和“补丁深度”拆成两个维度建模
+- 这样 runtime 才能识别一类 benchmark 里很常见的假推进：文件被碰了，但真实行为没改
+
+### 亮点 20：我把测试失败从“原始 bash 文本”推进成了结构化反馈，再反推下一轮 modify 的目标路径
+
+你可以说：
+
+“我后来发现一个很关键的问题：即使 agent 已经会改代码、会跑测试、失败后也不会直接 finalize，但如果失败反馈只是原始 stderr 文本，下一轮 modify 其实还是主要靠模型自己从长文本里猜。这个链路在 benchmark 里很容易退化成两种情况：要么读很多无关文件，要么知道测试失败了，但回不到真正的目标函数体。所以我把 verify 失败的反馈继续下沉到了 runtime：每次 `bash` 验证失败后，不再只保留 `exitCode` 和原始输出，而是额外解析出 failing tests、traceback 命中的代码路径、函数/方法锚点，以及 assertion / exception hints，然后把它们写成一条 `VERIFICATION_FEEDBACK` system message，并直接并回下一轮 verification requirement。这样 runtime 后面的 gate 不再只依赖用户原始 prompt 里的模糊描述，而能基于刚刚失败留下的结构化证据，明确要求下一轮回到目标代码路径继续 modify。” 
+
+代码证据：
+
+- `packages/runtime/src/langgraph.ts`
+  - `readBashOutputText()`：从 `bash` 的 stdout/stderr 拼出待分析文本
+  - `extractFailingTestsFromOutput()`：抽失败测试
+  - `extractTraceAnchorsFromOutput()`：抽 traceback 命中的代码路径和函数锚点
+  - `extractAssertionHintsFromOutput()`：抽 assertion / exception 线索
+  - `parseVerificationFailureFeedback()`：把原始验证失败输出收成结构化对象
+  - `createVerificationFeedbackMessage()`：把结构化失败反馈写成 `VERIFICATION_FEEDBACK` system message
+  - `buildVerificationRequirement(...)`：现在会吃 `latestVerificationFailure`
+  - `executeNode`：
+    - failed verify 后会更新 `latestVerificationFailure`
+    - 写入 `VERIFICATION_FEEDBACK`
+    - 再通过 `shouldForceReturnToTargetPathAfterFailedVerification` 这类 gate 强制下一轮回到目标路径
+- `apps/ide-web/src/minimax.ts`
+  - executor prompt 新增：如果最近消息里有 `VERIFICATION_FEEDBACK`，下一轮必须优先围绕这些信号继续 modify / verify，不要回头读无关文件
+- `packages/runtime/src/langgraph.test.ts`
+  - `verify 失败后会生成结构化失败反馈，并把下一轮 modify 拉回目标代码路径`
+
+这件事面试里最值得讲的点是：
+
+- 我没有满足于“验证失败后别 finalize”这种弱约束
+- 我把测试失败信息从原始文本推进成了 runtime 可消费的结构化信号
+- 这类设计的价值，不只是让模型更方便读日志，而是让后续 control loop 的 gate 有了更明确的目标路径依据
+
+你可以进一步补一句：
+
+“这一步我没有把它包装成 benchmark 已经改善了。更准确地说，这是 runtime feedback loop 的能力升级，benchmark 是否因此提分，还要再用 `2148 / 2674` 之类实例重新验证。” 
+
+### 亮点 21：我把 `2148` 暴露出的“import 级假推进”收成了更硬的 modify gate
+
+你可以说：
+
+“`psf__requests-2148` 给我的一个很直接的信号是：agent 已经知道问题和 `socket.error`、`ConnectionError` 这类概念有关，但它会停在一种假推进状态里，也就是只补 import，然后看起来像已经进入 modify phase。这个问题如果不在 runtime 层处理，模型就很容易把‘我已经碰到目标文件了’误当成‘我已经修到目标行为了’。所以我后来专门把这类情况收成了一个更硬的 modify gate：如果任务是行为修复，而且 runtime 已经知道目标代码路径和行为锚点，那么只在目标文件上做 import/comment/表层整理，就不再算一次有效 modify。runtime 会在真正执行工具前直接拦掉这类 edit，并追加一条 `MODIFICATION_POLICY`，要求下一轮必须继续命中真实函数体或异常路径。” 
+
+代码证据：
+
+- `packages/runtime/src/langgraph.ts`
+  - `writeLikeToolCallIsSuperficialBehaviorPatch()`
+  - `explainSuperficialBehaviorPatchViolation()`
+  - `executeNode`
+    - 在真正执行 `edit/write` 前先判断表层补丁
+    - 命中后直接写入 `MODIFICATION_POLICY`
+- `packages/runtime/src/langgraph.test.ts`
+  - `行为性任务里，只有 import/comment 级补丁时不能 finalize，必须继续命中真实行为路径`
+
+这件事面试里最值得讲的点是：
+
+- 我没有把“模型会自己知道 import 不够”当成默认假设
+- 我把“行为修复必须打到函数体/异常路径”变成了 runtime 能检查的条件
+- 这比继续堆 prompt 更接近 agent 本体能力建设
+
+### 亮点 22：我把 `2148` 里的“局部行为补丁被误判成大改”也拆出来修了
+
+你可以说：
+
+“`2148` 还有另一个很隐蔽的问题：之前的 budget guard 会把某些局部 try/except 行为补丁误判成‘宽范围控制流/异常映射重写’，结果 runtime 在 edit 执行前就把它打掉。这样模型就会卡在两个坏结果之间：真正的局部行为修复过不了 budget guard，而 import-only 的表层补丁却更容易活下来。所以我把 budget 逻辑又拆细了一层：如果 patch 确实命中了目标行为，而且改动范围还在局部预算内，就不会仅仅因为出现 try/except 或异常映射结构，就把它一刀切判成必拦的大改。” 
+
+代码证据：
+
+- `packages/runtime/src/langgraph.ts`
+  - `writeLikeToolCallTargetsBehavior()`
+  - `explainModificationBudgetViolation(...)`
+  - `executeNode`
+    - `targetsBehavior`
+    - `budgetViolation`
+
+这件事面试里最值得讲的点是：
+
+- 我不是简单把 budget guard 做得更严
+- 我是在把“表层补丁”和“局部行为修复”区分开
+- 否则 runtime 会自己制造一种反激励：逼模型退回 import-only 假推进
+
+### 亮点 23：我把 `2674` 暴露出的“共享热路径 import-only patch”单独建模了
+
+你可以说：
+
+“`psf__requests-2674` 暴露出的不是‘不会改’，而是另一类假推进：文件本身已经是共享热路径，比如 `requests/adapters.py`，但模型先落了一个 import-only 的表层补丁，然后 modify phase 就被这种浅层 patch 占住了。这个问题如果只看 `highRisk = 大改/宽改`，其实抓不住。所以我后来明确把 `sharedHotPath` 和 `highRisk rewrite` 拆成两个维度：前者描述路径风险，后者描述补丁深度。这样 runtime 就能单独识别‘共享热路径上的表层补丁’，并把它判成无效 modify，要求下一轮继续命中真实行为分支。” 
+
+代码证据：
+
+- `packages/runtime/src/langgraph.ts`
+  - `WriteLikeModificationAnalysis.sharedHotPath`
+  - `pathLooksLikeHighRiskSharedCode()`
+  - `writeLikeToolCallIsSuperficialBehaviorPatch()`
+  - `executeNode`
+    - `sharedHotModifiedPaths`
+    - `highRiskSuperficialBehaviorPaths`
+- `packages/runtime/src/langgraph.test.ts`
+  - `高风险共享路径上的 import 级表层补丁不能长期占住 modify phase`
+
+这件事面试里最值得讲的点是：
+
+- 我没有把“高风险”简单等同于“大 patch”
+- 我把“路径风险”和“补丁深度”分开建模
+- 这样 control loop 才能识别 benchmark 里很常见的一类假推进
+
+### 亮点 24：我会把 benchmark failure class 下沉到 runtime，而不是停在 benchmark prompt
+
+你可以说：
+
+“这几轮 benchmark 最重要的收获，不是我把某两道题刷过了，而是我开始区分两类 failure class：一类是 `2148` 这种‘表层补丁冒充行为修复’，另一类是 `2674` 这种‘共享热路径上的浅层补丁长期占住 modify phase’。我的处理方式不是继续往 benchmark prompt 里塞更多题目特例，而是把它们下沉到 runtime gate：让工具执行前就能识别无效 modify，并把控制环强制拉回目标函数体和行为路径。这样即使 benchmark 分数暂时还没涨，这一轮工作也仍然是在提高 agent 本体能力，而不是只是在刷题。” 
+
+代码证据：
+
+- `packages/tools/src/builtin.ts`
+  - `normalizeEditInput()`：补齐 benchmark 风格的小写参数别名，先消除工具协议阻抗
+- `packages/runtime/src/langgraph.ts`
+  - `writeLikeToolCallIsSuperficialBehaviorPatch()`
+  - `writeLikeToolCallTargetsBehavior()`
+  - `explainModificationBudgetViolation(...)`
+  - `executeNode`
+- `packages/runtime/src/langgraph.test.ts`
+  - `行为性任务里，只有 import/comment 级补丁时不能 finalize，必须继续命中真实行为路径`
+  - `高风险共享路径上的 import 级表层补丁不能长期占住 modify phase`
+
+这件事面试里最值得讲的点是：
+
+- 我会区分“benchmark 上看起来像在推进”和“runtime 真的把无效 modify 挡掉”
+- 我不会把 prompt 层的启发式写法包装成 agent 本体能力
+- 我更关注哪些策略已经在 runtime 代码里被强制执行，并且有场景测试兜住
+
 ## 讲项目时的推荐顺序
 
 你可以按这个顺序讲：

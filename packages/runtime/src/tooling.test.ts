@@ -578,6 +578,53 @@ describe("RuntimeToolExecutor", () => {
     assert.match(updatedContent, /%\((name)\)s:%\((filename)\)s:%\((lineno)\)d/);
   });
 
+  test("build 模式的 edit 工具兼容 oldtext/newtext 这类小写 benchmark 变体参数", async () => {
+    const store = new InMemoryRuntimeStore();
+    store.sessionMap.set("session_edit_lowercase_text_aliases", {
+      id: "session_edit_lowercase_text_aliases",
+      workspaceId: "workspace_1",
+      title: "edit lowercase alias session",
+      status: "active",
+      activeAgentMode: "build",
+      summary: {
+        shortSummary: "",
+        openLoops: [],
+        nextActions: [],
+        importantFacts: [],
+      } satisfies SessionSummary,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const filePath = path.join(workspaceRoot, "notes", "alias-lowercase-test.ts");
+    await writeFile(
+      filePath,
+      [
+        "from .packages.urllib3.exceptions import ResponseError",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const executor = new RuntimeToolExecutor(store, createBuiltinToolRegistry());
+    const result = await executor.execute({
+      sessionId: "session_edit_lowercase_text_aliases",
+      name: "edit",
+      input: {
+        root: workspaceRoot,
+        path: "notes/alias-lowercase-test.ts",
+        oldtext: "from .packages.urllib3.exceptions import ResponseError",
+        newtext:
+          "from .packages.urllib3.exceptions import ResponseError\nfrom .packages.urllib3.exceptions import ClosedPoolError",
+      },
+    });
+
+    assert.equal(result.ok, true);
+
+    const updatedContent = await readFile(filePath, "utf8");
+    assert.match(updatedContent, /ClosedPoolError/);
+  });
+
   test("build 模式的 edit 工具兼容 search_replace/new_content 这类 benchmark 风格参数", async () => {
     const store = new InMemoryRuntimeStore();
     store.sessionMap.set("session_edit_benchmark_aliases", {

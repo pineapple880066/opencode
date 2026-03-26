@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import path from "node:path";
 
 import {
@@ -547,6 +548,24 @@ function createModificationPolicyMessage(message: string): string {
   ].join("\n");
 }
 
+function createVerificationFeedbackMessage(
+  feedback: VerificationFailureFeedback,
+  command: string | undefined,
+): string {
+  const lines = [
+    "VERIFICATION_FEEDBACK: 最近一次 verify 已解析出结构化失败信号。",
+    command ? `verifyCommand=${command}` : undefined,
+    feedback.failingTests.length > 0 ? `失败测试：${feedback.failingTests.join("、")}` : undefined,
+    feedback.targetCodePaths.length > 0 ? `目标代码路径：${feedback.targetCodePaths.join("、")}` : undefined,
+    feedback.targetBehaviorAnchors.length > 0 ? `目标行为锚点：${feedback.targetBehaviorAnchors.join("、")}` : undefined,
+    feedback.assertionHints.length > 0 ? `断言/异常线索：${feedback.assertionHints.join("；")}` : undefined,
+    ...feedback.summaryLines.map((line) => `补充线索：${line}`),
+    "下一轮不要继续读取无关文件；优先回到目标代码路径继续 modify，并围绕上述失败测试重新验证。",
+  ];
+
+  return lines.filter((line): line is string => Boolean(line)).join("\n");
+}
+
 type VerificationLevel = "none" | "structural" | "behavioral";
 
 interface VerificationRequirement {
@@ -555,6 +574,8 @@ interface VerificationRequirement {
   requireAdjacentRegression: boolean;
   recommendedCommandKinds: string[];
   targetHints: string[];
+  targetCodePaths: string[];
+  targetBehaviorAnchors: string[];
   adjacentHints: string[];
   targetedCommands: string[];
   adjacentCommands: string[];
@@ -575,8 +596,17 @@ interface VerificationProgress {
   hasAdjacentRegressionSuccess: boolean;
 }
 
+interface VerificationFailureFeedback {
+  failingTests: string[];
+  targetCodePaths: string[];
+  targetBehaviorAnchors: string[];
+  assertionHints: string[];
+  summaryLines: string[];
+}
+
 interface WriteLikeModificationAnalysis {
   path?: string;
+  sharedHotPath: boolean;
   documentationOnly: boolean;
   importOnly: boolean;
   substantialCodeChange: boolean;
@@ -596,6 +626,52 @@ interface ModificationBudget {
   suggestedCommands: string[];
   rationale: string;
 }
+
+const GENERIC_BEHAVIOR_ANCHOR_STOPWORDS = new Set([
+  "test",
+  "tests",
+  "case",
+  "request",
+  "requests",
+  "response",
+  "responses",
+  "error",
+  "errors",
+  "invalid",
+  "valid",
+  "timeout",
+  "timeouts",
+  "stream",
+  "streaming",
+  "socket",
+  "content",
+  "custom",
+  "cookie",
+  "cookies",
+  "handles",
+  "raises",
+  "returns",
+  "allows",
+  "rejects",
+  "keeps",
+  "preserves",
+  "uses",
+  "supports",
+  "accepts",
+  "fails",
+  "works",
+  "with",
+  "without",
+  "when",
+  "from",
+  "into",
+  "for",
+  "and",
+  "or",
+  "none",
+  "does",
+  "not",
+]);
 
 /**
  * 基于用户消息的关键词简单启发式判断，是否存在“想让 agent 修改代码/文件”的意图。
@@ -678,6 +754,92 @@ function extractTestSelectorHintsFromText(text: string): string[] {
   return uniqueStrings(
     [...pytestSelectors, ...dottedUnittestTargets].filter((value) => /test/i.test(value)),
   );
+}
+
+function normalizeBehaviorAnchor(value: string): string | undefined {
+  const normalized = value.trim().replace(/[()`"'.,:;[\]{}]/g, "");
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(normalized)) {
+    return undefined;
+  }
+
+  const lower = normalized.toLowerCase();
+  if (lower.length < 3 || GENERIC_BEHAVIOR_ANCHOR_STOPWORDS.has(lower)) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function deriveBehaviorAnchorsFromTestSelector(selector: string): string[] {
+  const lastSegment = selector.split("::").at(-1) ?? selector;
+  const normalized = lastSegment.replace(/^test_/, "");
+  const parts = normalized.split("_").filter(Boolean);
+  const anchors: string[] = [];
+  const boundaryWords = new Set([
+    "handles",
+    "raises",
+    "returns",
+    "allows",
+    "rejects",
+    "keeps",
+    "preserves",
+    "uses",
+    "supports",
+    "accepts",
+    "fails",
+    "works",
+    "with",
+    "without",
+    "when",
+    "from",
+    "into",
+    "for",
+    "and",
+    "or",
+    "none",
+  ]);
+
+  const boundaryIndex = parts.findIndex((part) => boundaryWords.has(part.toLowerCase()));
+  const candidateParts = boundaryIndex > 0 ? parts.slice(0, boundaryIndex) : parts;
+  if (candidateParts.length >= 2) {
+    const anchor = normalizeBehaviorAnchor(candidateParts.join("_"));
+    if (anchor) {
+      anchors.push(anchor);
+    }
+  }
+
+  for (const part of candidateParts) {
+    const anchor = normalizeBehaviorAnchor(part);
+    if (anchor) {
+      anchors.push(anchor);
+    }
+  }
+
+  return uniqueStrings(anchors);
+}
+
+function extractBehaviorTargetAnchorsFromText(text: string): string[] {
+  const contextualIdentifiers = [
+    ...(text.match(/(?:里的|里|in)\s+([A-Za-z_][A-Za-z0-9_]*)/g) ?? []).map((match) =>
+      match.replace(/^(?:里的|里|in)\s+/, ""),
+    ),
+    ...(text.match(/(?:函数|方法|function|method)\s+([A-Za-z_][A-Za-z0-9_]*)/gi) ?? []).map((match) =>
+      match.replace(/^(?:函数|方法|function|method)\s+/i, ""),
+    ),
+  ];
+  const directMatches = [
+    ...(text.match(/`([A-Za-z_][A-Za-z0-9_]*)`/g) ?? []).map((match) => match.slice(1, -1)),
+    ...(text.match(/\b([A-Za-z_][A-Za-z0-9_]*)\(\)/g) ?? []).map((match) => match.slice(0, -2)),
+    ...(text.match(/\b[A-Za-z_][A-Za-z0-9_]*\/[A-Za-z_][A-Za-z0-9_]*\b/g) ?? []).flatMap((match) => match.split("/")),
+    ...contextualIdentifiers,
+  ];
+  const selectorAnchors = extractTestSelectorHintsFromText(text).flatMap(deriveBehaviorAnchorsFromTestSelector);
+
+  return uniqueStrings(
+    [...directMatches, ...selectorAnchors]
+      .map((value) => normalizeBehaviorAnchor(value))
+      .filter((value): value is string => Boolean(value)),
+  ).slice(0, 6);
 }
 
 function pickStringAliasFromUnknown(
@@ -852,14 +1014,16 @@ function analyzeWriteLikeModification(toolCall: LangGraphToolCall): WriteLikeMod
   const broadFlowRewrite = changeTextLooksHighRisk(changedText);
   const documentationOnly = changedLines.length > 0 && changedLines.every((line) => !isMeaningfulCodeLine(line) && !isImportLikeLine(line));
   const importOnly = changedLines.length > 0 && meaningfulCodeLineCount === 0 && changedLines.some((line) => isImportLikeLine(line));
+  const sharedHotPath = pathLooksLikeHighRiskSharedCode(path);
   const substantialCodeChange =
     pathLooksLikeCodeFile(path)
     && !pathLooksLikeDocumentationFile(path)
     && meaningfulCodeLineCount > 0;
-  const highRisk = substantialCodeChange && pathLooksLikeHighRiskSharedCode(path);
+  const highRisk = substantialCodeChange && sharedHotPath;
 
   return {
     path,
+    sharedHotPath,
     documentationOnly,
     importOnly,
     substantialCodeChange,
@@ -917,6 +1081,7 @@ function buildModificationBudget(
 function explainModificationBudgetViolation(
   budget: ModificationBudget,
   analysis: WriteLikeModificationAnalysis,
+  targetsBehavior: boolean,
 ): string | undefined {
   if (!budget.enforceMinimalDelta) {
     return undefined;
@@ -924,7 +1089,12 @@ function explainModificationBudgetViolation(
 
   const reasons: string[] = [];
 
-  if (budget.disallowBroadFlowRewrite && analysis.broadFlowRewrite) {
+  const allowLocalizedTargetPatch =
+    targetsBehavior
+    && analysis.changedLineCount <= budget.maxChangedLines
+    && analysis.meaningfulCodeLineCount <= budget.maxMeaningfulCodeLines;
+
+  if (budget.disallowBroadFlowRewrite && analysis.broadFlowRewrite && !allowLocalizedTargetPatch) {
     reasons.push("这次 edit 像宽范围控制流/异常映射重写，不是最小增量补丁。");
   }
 
@@ -986,6 +1156,7 @@ function collectVerificationTargetHints(
   state: AgentGraphState,
   userMessage: string | undefined,
   modifiedPaths: string[],
+  failureFeedback?: VerificationFailureFeedback,
 ): string[] {
   const corpus = collectVerificationIntentText(state, userMessage);
   const testSelectorHints = extractTestSelectorHintsFromText(corpus);
@@ -998,7 +1169,45 @@ function collectVerificationTargetHints(
     ...textPathHints,
     ...recentTestPaths,
     ...modifiedTestPaths,
+    ...(failureFeedback?.failingTests ?? []),
   ]).slice(0, 3);
+}
+
+function collectTargetCodePaths(
+  state: AgentGraphState,
+  userMessage: string | undefined,
+  modifiedPaths: string[],
+  failureFeedback?: VerificationFailureFeedback,
+): string[] {
+  const corpus = collectVerificationIntentText(state, userMessage);
+  const textCodePaths = extractPathHintsFromText(corpus).filter(
+    (candidatePath) => pathLooksLikeCodeFile(candidatePath) && !pathLooksLikeTestFile(candidatePath),
+  );
+  const recentCodePaths = collectRecentTouchedPaths(state).filter(
+    (candidatePath) => pathLooksLikeCodeFile(candidatePath) && !pathLooksLikeTestFile(candidatePath),
+  );
+  const modifiedCodePaths = modifiedPaths.filter(
+    (candidatePath) => pathLooksLikeCodeFile(candidatePath) && !pathLooksLikeTestFile(candidatePath),
+  );
+
+  return uniqueStrings([
+    ...textCodePaths,
+    ...modifiedCodePaths,
+    ...recentCodePaths,
+    ...(failureFeedback?.targetCodePaths ?? []),
+  ]).slice(0, 4);
+}
+
+function collectBehaviorTargetAnchors(
+  state: AgentGraphState,
+  userMessage: string | undefined,
+  failureFeedback?: VerificationFailureFeedback,
+): string[] {
+  const corpus = collectVerificationIntentText(state, userMessage);
+  return uniqueStrings([
+    ...extractBehaviorTargetAnchorsFromText(corpus),
+    ...(failureFeedback?.targetBehaviorAnchors ?? []),
+  ]).slice(0, 6);
 }
 
 function collectAdjacentRegressionHints(
@@ -1105,6 +1314,104 @@ function buildAdjacentRegressionCommands(
   return uniqueStrings(commands).slice(0, 2);
 }
 
+function pathMatchesTargetCodePaths(filePath: string | undefined, targetCodePaths: string[]): boolean {
+  if (!filePath || targetCodePaths.length === 0) {
+    return targetCodePaths.length === 0;
+  }
+
+  return targetCodePaths.some((candidate) =>
+    filePath === candidate
+    || filePath.endsWith(`/${candidate}`)
+    || candidate.endsWith(`/${filePath}`)
+    || path.basename(filePath) === path.basename(candidate),
+  );
+}
+
+function changeTextHitsBehaviorAnchors(
+  before: string | undefined,
+  after: string | undefined,
+  targetBehaviorAnchors: string[],
+): boolean {
+  if (targetBehaviorAnchors.length === 0) {
+    return false;
+  }
+
+  const isolated = typeof before === "string" && typeof after === "string"
+    ? stripSharedLineContext(before, after)
+    : { beforeChanged: before ?? "", afterChanged: after ?? "" };
+  const changedText = [isolated.beforeChanged, isolated.afterChanged]
+    .filter((chunk) => chunk.trim().length > 0)
+    .join("\n");
+
+  return targetBehaviorAnchors.some((anchor) => new RegExp(`\\b${anchor}\\b`).test(changedText));
+}
+
+function writeLikeToolCallTargetsBehavior(
+  toolCall: LangGraphToolCall,
+  requirement: VerificationRequirement,
+): boolean {
+  const analysis = analyzeWriteLikeModification(toolCall);
+  if (!analysis?.substantialCodeChange) {
+    return false;
+  }
+
+  if (!pathMatchesTargetCodePaths(analysis.path, requirement.targetCodePaths)) {
+    return false;
+  }
+
+  if (requirement.targetBehaviorAnchors.length === 0) {
+    return true;
+  }
+
+  const { before, after } = readWriteLikeChangeSegments(toolCall.input);
+  return changeTextHitsBehaviorAnchors(before, after, requirement.targetBehaviorAnchors);
+}
+
+function writeLikeToolCallIsSuperficialBehaviorPatch(
+  toolCall: LangGraphToolCall,
+  requirement: VerificationRequirement,
+): boolean {
+  const analysis = analyzeWriteLikeModification(toolCall);
+  if (!analysis) {
+    return false;
+  }
+
+  if (requirement.requiredLevel !== "behavioral") {
+    return false;
+  }
+
+  const targetsKnownPath =
+    pathMatchesTargetCodePaths(analysis.path, requirement.targetCodePaths)
+    || (analysis.sharedHotPath && requirement.targetCodePaths.length === 0);
+
+  if (!targetsKnownPath) {
+    return false;
+  }
+
+  return analysis.importOnly || analysis.documentationOnly || !analysis.substantialCodeChange;
+}
+
+function explainSuperficialBehaviorPatchViolation(
+  requirement: VerificationRequirement,
+  analysis: WriteLikeModificationAnalysis,
+): string {
+  return [
+    "当前 edit 只在目标文件上做 import/comment/表层整理，不算有效 modify。",
+    requirement.targetCodePaths.length > 0
+      ? `目标代码路径：${requirement.targetCodePaths.join("、")}`
+      : undefined,
+    requirement.targetBehaviorAnchors.length > 0
+      ? `目标行为锚点：${requirement.targetBehaviorAnchors.join("、")}`
+      : undefined,
+    analysis.sharedHotPath
+      ? `路径 ${analysis.path} 属于共享热路径，import/comment 级补丁不能长期占住 modify phase。`
+      : undefined,
+    "下一轮必须直接修改函数体、条件分支、异常映射、返回值或参数处理，不要只补 import 或注释。",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
 // buildVerificationRequirement 是当前 verification policy 的核心。
 // 它不再只回答一个布尔问题“要不要验证”，而是显式返回：
 // - 当前需要的是结构性验证，还是行为验证
@@ -1118,6 +1425,7 @@ function buildVerificationRequirement(
   userMessage: string | undefined,
   modifiedPaths: string[],
   highRiskPaths: string[],
+  failureFeedback?: VerificationFailureFeedback,
 ): VerificationRequirement {
   const userIntent = userMessage ?? "";
   if (textSuggestsDocumentationOnly(userIntent) && !textSuggestsBehavioralChange(userIntent)) {
@@ -1127,6 +1435,8 @@ function buildVerificationRequirement(
       requireAdjacentRegression: false,
       recommendedCommandKinds: [],
       targetHints: [],
+      targetCodePaths: [],
+      targetBehaviorAnchors: [],
       adjacentHints: [],
       targetedCommands: [],
       adjacentCommands: [],
@@ -1142,6 +1452,8 @@ function buildVerificationRequirement(
       requireAdjacentRegression: false,
       recommendedCommandKinds: [],
       targetHints: [],
+      targetCodePaths: [],
+      targetBehaviorAnchors: [],
       adjacentHints: [],
       targetedCommands: [],
       adjacentCommands: [],
@@ -1159,6 +1471,8 @@ function buildVerificationRequirement(
       requireAdjacentRegression: false,
       recommendedCommandKinds: [],
       targetHints: [],
+      targetCodePaths: [],
+      targetBehaviorAnchors: [],
       adjacentHints: [],
       targetedCommands: [],
       adjacentCommands: [],
@@ -1177,6 +1491,8 @@ function buildVerificationRequirement(
       requireAdjacentRegression: false,
       recommendedCommandKinds: [],
       targetHints: [],
+      targetCodePaths: [],
+      targetBehaviorAnchors: [],
       adjacentHints: [],
       targetedCommands: [],
       adjacentCommands: [],
@@ -1184,7 +1500,9 @@ function buildVerificationRequirement(
     };
   }
 
-  const targetHints = collectVerificationTargetHints(state, userMessage, modifiedPaths);
+  const targetHints = collectVerificationTargetHints(state, userMessage, modifiedPaths, failureFeedback);
+  const targetCodePaths = collectTargetCodePaths(state, userMessage, modifiedPaths, failureFeedback);
+  const targetBehaviorAnchors = collectBehaviorTargetAnchors(state, userMessage, failureFeedback);
   const adjacentHints = collectAdjacentRegressionHints(targetHints, highRiskPaths);
   const targetedCommands = buildTargetedBehavioralCommands(targetHints);
   const adjacentCommands = buildAdjacentRegressionCommands(targetHints, adjacentHints);
@@ -1199,23 +1517,34 @@ function buildVerificationRequirement(
           `当前修改命中了高风险共享路径：${highRiskPaths.join("、")}`,
           `先跑主目标，再补同文件/同模块的相邻回归：${adjacentHints.join("、")}`,
           "不要只跑单个 case 就 finalize，至少做整文件/整模块级行为验证",
+          failureFeedback?.failingTests.length
+            ? `最近失败测试：${failureFeedback.failingTests.join("、")}；下一轮 verify 应围绕这些失败点补最小验证。`
+            : undefined,
         ]
       : targetHints.length > 0
         ? [
             `优先跑与这些目标直接相关的局部测试/局部回归：${targetHints.join("、")}`,
             "不要只跑结构性检查（如 py_compile、typecheck、lint、git diff --check）就收尾",
+            failureFeedback?.targetCodePaths.length
+              ? `最近失败堆栈命中了这些代码路径：${failureFeedback.targetCodePaths.join("、")}。`
+              : undefined,
           ]
         : [
             "优先跑最小行为验证：单测、局部回归、单文件测试或单用例测试",
             "只有结构性检查通过还不够，至少要有一次真正的行为级验证",
+            failureFeedback?.assertionHints.length
+              ? `最近失败线索：${failureFeedback.assertionHints.join("；")}`
+              : undefined,
           ];
 
     return {
       requiredLevel: "behavioral",
       requireTargetedBehavioral: targetHints.length > 0,
       requireAdjacentRegression,
-      recommendedCommandKinds,
+      recommendedCommandKinds: recommendedCommandKinds.filter((line): line is string => Boolean(line)),
       targetHints,
+      targetCodePaths,
+      targetBehaviorAnchors,
       adjacentHints,
       targetedCommands,
       adjacentCommands,
@@ -1240,6 +1569,8 @@ function buildVerificationRequirement(
         "可选形式包括 git diff --check、语法检查、类型检查、lint 或最小 build",
       ],
       targetHints: [],
+      targetCodePaths,
+      targetBehaviorAnchors,
       adjacentHints: [],
       targetedCommands: [],
       adjacentCommands: [],
@@ -1253,6 +1584,8 @@ function buildVerificationRequirement(
     requireAdjacentRegression: false,
     recommendedCommandKinds: [],
     targetHints: [],
+    targetCodePaths,
+    targetBehaviorAnchors,
     adjacentHints: [],
     targetedCommands: [],
     adjacentCommands: [],
@@ -1281,6 +1614,14 @@ function formatVerificationRequirement(requirement: VerificationRequirement): st
 
   if (requirement.targetHints.length > 0) {
     lines.push(`优先目标：${requirement.targetHints.join("、")}`);
+  }
+
+  if (requirement.targetCodePaths.length > 0) {
+    lines.push(`目标代码路径：${requirement.targetCodePaths.join("、")}`);
+  }
+
+  if (requirement.targetBehaviorAnchors.length > 0) {
+    lines.push(`目标行为锚点：${requirement.targetBehaviorAnchors.join("、")}`);
   }
 
   if (requirement.adjacentHints.length > 0) {
@@ -1578,6 +1919,170 @@ function readBashExitCode(output: unknown): number | undefined {
   }
 
   return typeof output.exitCode === "number" && Number.isFinite(output.exitCode) ? output.exitCode : undefined;
+}
+
+function readBashOutputText(output: unknown): string {
+  if (!isRecord(output)) {
+    return "";
+  }
+
+  const stdout = typeof output.stdout === "string" ? output.stdout : "";
+  const stderr = typeof output.stderr === "string" ? output.stderr : "";
+  return [stdout, stderr].filter((chunk) => chunk.trim().length > 0).join("\n");
+}
+
+function normalizeWorkspaceRelativePath(
+  workspacePath: string,
+  candidatePath: string,
+): string | undefined {
+  const normalizedCandidate = candidatePath.trim();
+  if (normalizedCandidate.length === 0) {
+    return undefined;
+  }
+
+  const absolutePath = path.isAbsolute(normalizedCandidate)
+    ? normalizedCandidate
+    : path.resolve(workspacePath, normalizedCandidate);
+  const normalizedWorkspacePath = (() => {
+    try {
+      return realpathSync.native(workspacePath);
+    } catch {
+      return path.resolve(workspacePath);
+    }
+  })();
+  const normalizedAbsolutePath = (() => {
+    try {
+      return realpathSync.native(absolutePath);
+    } catch {
+      return absolutePath;
+    }
+  })();
+  const relativePath = path.relative(normalizedWorkspacePath, normalizedAbsolutePath);
+  if (relativePath.startsWith("..")) {
+    return undefined;
+  }
+
+  return relativePath.split(path.sep).join("/");
+}
+
+function extractFailingTestsFromOutput(outputText: string): string[] {
+  const failingTests: string[] = [];
+
+  for (const match of outputText.matchAll(/^\s*FAILED\s+([^\s]+::[^\s]+)\s*(?:-.*)?$/gm)) {
+    const selector = match[1]?.trim();
+    if (selector) {
+      failingTests.push(selector);
+    }
+  }
+
+  for (const match of outputText.matchAll(/^\s*(?:FAIL|ERROR):\s+[^\s]+\s+\(([^)]+)\)\s*$/gm)) {
+    const selector = match[1]?.trim();
+    if (selector) {
+      failingTests.push(selector);
+    }
+  }
+
+  return uniqueStrings(failingTests).slice(0, 4);
+}
+
+function extractTraceAnchorsFromOutput(
+  outputText: string,
+  workspacePath: string,
+): Pick<VerificationFailureFeedback, "targetCodePaths" | "targetBehaviorAnchors"> {
+  const targetCodePaths: string[] = [];
+  const targetBehaviorAnchors: string[] = [];
+
+  for (const match of outputText.matchAll(/File "([^"]+)", line \d+, in ([A-Za-z_][A-Za-z0-9_]*)/g)) {
+    const rawPath = match[1]?.trim();
+    const rawAnchor = match[2]?.trim();
+    if (rawPath) {
+      const normalizedPath = normalizeWorkspaceRelativePath(workspacePath, rawPath);
+      if (normalizedPath && pathLooksLikeCodeFile(normalizedPath) && !pathLooksLikeTestFile(normalizedPath)) {
+        targetCodePaths.push(normalizedPath);
+      }
+    }
+
+    if (rawAnchor) {
+      const normalizedAnchor = normalizeBehaviorAnchor(rawAnchor);
+      if (normalizedAnchor) {
+        targetBehaviorAnchors.push(normalizedAnchor);
+      }
+    }
+  }
+
+  return {
+    targetCodePaths: uniqueStrings(targetCodePaths).slice(0, 4),
+    targetBehaviorAnchors: uniqueStrings(targetBehaviorAnchors).slice(0, 6),
+  };
+}
+
+function extractAssertionHintsFromOutput(outputText: string): string[] {
+  const hints: string[] = [];
+
+  for (const match of outputText.matchAll(/^\s*AssertionError:.*$/gm)) {
+    hints.push(match[0].trim());
+  }
+
+  for (const match of outputText.matchAll(/^\s*[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):.*$/gm)) {
+    hints.push(match[0].trim());
+  }
+
+  for (const match of outputText.matchAll(/^\s*E\s+.+$/gm)) {
+    hints.push(match[0].trim());
+  }
+
+  return uniqueStrings(hints).slice(0, 4);
+}
+
+function extractVerificationSummaryLines(outputText: string): string[] {
+  const lines = outputText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const summaryLines = lines.filter((line) =>
+    /^(?:FAILED|FAIL|ERROR|AssertionError|[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception):)/.test(line),
+  );
+
+  return uniqueStrings(summaryLines).slice(0, 4);
+}
+
+// 这里把 verify 失败的 stdout/stderr 结构化成 runtime 可消费的反馈。
+// 目的不是做完整测试框架 AST，而是先抽出对下一轮 modify 最有价值的 4 类信号：
+// - failing tests
+// - traceback 指向的代码路径
+// - traceback 里的函数/方法锚点
+// - assertion / exception hints
+function parseVerificationFailureFeedback(
+  output: unknown,
+  workspacePath: string,
+): VerificationFailureFeedback | undefined {
+  const outputText = readBashOutputText(output);
+  if (outputText.trim().length === 0) {
+    return undefined;
+  }
+
+  const failingTests = extractFailingTestsFromOutput(outputText);
+  const traceAnchors = extractTraceAnchorsFromOutput(outputText, workspacePath);
+  const assertionHints = extractAssertionHintsFromOutput(outputText);
+  const summaryLines = extractVerificationSummaryLines(outputText);
+
+  if (
+    failingTests.length === 0
+    && traceAnchors.targetCodePaths.length === 0
+    && traceAnchors.targetBehaviorAnchors.length === 0
+    && assertionHints.length === 0
+    && summaryLines.length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    failingTests,
+    targetCodePaths: traceAnchors.targetCodePaths,
+    targetBehaviorAnchors: traceAnchors.targetBehaviorAnchors,
+    assertionHints,
+    summaryLines,
+  };
 }
 
 /**
@@ -1907,15 +2412,27 @@ export function createAgentLangGraph(
     }
 
     let runtimeState: AgentGraphState = state.runtimeState;
-    let executedToolCalls = 0;
-    let duplicateToolCalls = 0;
-    let executedWriteLikeTool = false;
-    let hasSubstantiveBehavioralEdit = false;
-    let lastSuccessfulToolCallKey: string | undefined;
-    const viewReadBudgets = new Map<string, ViewReadBudgetState>();
-    const modifiedPathsSinceLatestWrite = new Set<string>();
-    const superficialBehaviorPaths = new Set<string>();
-    const highRiskModifiedPaths = new Set<string>();
+	    let executedToolCalls = 0;
+	    let duplicateToolCalls = 0;
+	    let executedWriteLikeTool = false;
+	    let hasSubstantiveBehavioralEdit = false;
+	    let hasTargetBehaviorEdit = false;
+	    let lastSuccessfulToolCallKey: string | undefined;
+	    const viewReadBudgets = new Map<string, ViewReadBudgetState>();
+	    const modifiedPathsSinceLatestWrite = new Set<string>();
+	    const superficialBehaviorPaths = new Set<string>();
+	    // sharedHotModifiedPaths 专门记录“命中过共享热路径”的写入，
+	    // 即使这次写入只是 import/comment 级表层补丁，也要保留下来。
+	    //
+	    // 之前这里只看 highRiskModifiedPaths，而 highRisk 的定义要求：
+	    // - substantialCodeChange
+	    // - 且 sharedHotPath
+	    //
+	    // 结果像 adapters.py 上的 import-only patch，会被识别成 shared hot path，
+	    // 但不会进入 highRiskModifiedPaths，进而漏掉
+	    // “共享热路径不允许表层补丁长期占住 modify phase” 这条策略。
+	    const sharedHotModifiedPaths = new Set<string>();
+	    const highRiskModifiedPaths = new Set<string>();
     let verificationProgress: VerificationProgress = {
       attempted: false,
       latestAttemptFailed: false,
@@ -1923,6 +2440,7 @@ export function createAgentLangGraph(
       hasTargetedBehavioralSuccess: false,
       hasAdjacentRegressionSuccess: false,
     };
+    let latestVerificationFailure: VerificationFailureFeedback | undefined;
 
     for (let round = 0; round < maxToolRounds; round += 1) {
       const execution = await hooks.executor(runtimeState, {
@@ -1946,14 +2464,20 @@ export function createAgentLangGraph(
         state.userMessage,
         [...modifiedPathsSinceLatestWrite],
         [...highRiskModifiedPaths],
+        latestVerificationFailure,
       );
-      const hasSatisfiedVerificationSinceLatestWrite = satisfiesVerificationRequirement(
-        verificationRequirement,
-        verificationProgress,
-      );
-      const shouldForceModifyAfterKnownRead =
-        toolCalls.length > 0
-        && executionPhase !== "finalize"
+	      const hasSatisfiedVerificationSinceLatestWrite = satisfiesVerificationRequirement(
+	        verificationRequirement,
+	        verificationProgress,
+	      );
+	      const hasConcreteBehaviorTarget =
+	        verificationRequirement.targetCodePaths.length > 0 || verificationRequirement.targetBehaviorAnchors.length > 0;
+	      const highRiskSuperficialBehaviorPaths = [...superficialBehaviorPaths].filter((candidatePath) =>
+	        sharedHotModifiedPaths.has(candidatePath),
+	      );
+	      const shouldForceModifyAfterKnownRead =
+	        toolCalls.length > 0
+	        && executionPhase !== "finalize"
         && executionPhase !== "verify"
         && executedToolCalls > 0
         && !executedWriteLikeTool
@@ -1978,20 +2502,39 @@ export function createAgentLangGraph(
         && !verificationProgress.attempted
         && (toolCalls.length === 0 || executionPhase === "finalize")
         && round < maxToolRounds - 1;
-      const shouldForceSubstantiveBehaviorEdit =
-        verificationRequirement.requiredLevel === "behavioral"
-        && modifiedPathsSinceLatestWrite.size > 0
-        && executedWriteLikeTool
-        && !hasSubstantiveBehavioralEdit
-        && (toolCalls.length === 0 || executionPhase === "finalize" || executionPhase === "verify")
-        && round < maxToolRounds - 1;
-      const shouldForceRetryAfterFailedVerification =
-        verificationRequirement.requiredLevel !== "none"
-        && modifiedPathsSinceLatestWrite.size > 0
-        && verificationProgress.attempted
-        && verificationProgress.latestAttemptFailed
-        && (toolCalls.length === 0 || executionPhase === "finalize")
-        && round < maxToolRounds - 1;
+	      const shouldForceSubstantiveBehaviorEdit =
+	        verificationRequirement.requiredLevel === "behavioral"
+	        && modifiedPathsSinceLatestWrite.size > 0
+	        && executedWriteLikeTool
+	        && !hasSubstantiveBehavioralEdit
+	        && (toolCalls.length === 0 || executionPhase === "finalize" || executionPhase === "verify")
+	        && round < maxToolRounds - 1;
+	      const shouldForceTargetBehaviorHit =
+	        verificationRequirement.requiredLevel === "behavioral"
+	        && hasConcreteBehaviorTarget
+	        && modifiedPathsSinceLatestWrite.size > 0
+	        && executedWriteLikeTool
+	        && !hasTargetBehaviorEdit
+	        && (toolCalls.length === 0 || executionPhase === "finalize" || executionPhase === "verify")
+	        && round < maxToolRounds - 1;
+	      const shouldForceRetryAfterFailedVerification =
+	        verificationRequirement.requiredLevel !== "none"
+	        && modifiedPathsSinceLatestWrite.size > 0
+	        && verificationProgress.attempted
+	        && verificationProgress.latestAttemptFailed
+	        && (toolCalls.length === 0 || executionPhase === "finalize")
+	        && round < maxToolRounds - 1;
+	      const shouldForceReturnToTargetPathAfterFailedVerification =
+	        verificationRequirement.requiredLevel === "behavioral"
+	        && hasConcreteBehaviorTarget
+	        && modifiedPathsSinceLatestWrite.size > 0
+	        && verificationProgress.attempted
+	        && verificationProgress.latestAttemptFailed
+	        && (toolCalls.length === 0
+	          || executionPhase === "finalize"
+	          || executionPhase === "verify"
+	          || !toolCalls.some((toolCall) => writeLikeToolCallTargetsBehavior(toolCall, verificationRequirement)))
+	        && round < maxToolRounds - 1;
       // 这里处理的是“verify 虽然成功了，但等级不够”的情况。
       // 典型例子：
       // - 行为性修改只跑了 py_compile / typecheck
@@ -1999,14 +2542,31 @@ export function createAgentLangGraph(
       //
       // 这类情况如果直接 finalize，用户会看到“验证成功”的假象，
       // 但 runtime 其实还没有拿到足够贴近修改点的证据。
-      const shouldForceStrongerVerification =
-        verificationRequirement.requiredLevel !== "none"
-        && modifiedPathsSinceLatestWrite.size > 0
-        && verificationProgress.attempted
-        && !verificationProgress.latestAttemptFailed
-        && !hasSatisfiedVerificationSinceLatestWrite
-        && (toolCalls.length === 0 || executionPhase === "finalize")
-        && round < maxToolRounds - 1;
+	      const shouldForceStrongerVerification =
+	        verificationRequirement.requiredLevel !== "none"
+	        && modifiedPathsSinceLatestWrite.size > 0
+	        && verificationProgress.attempted
+	        && !verificationProgress.latestAttemptFailed
+	        && !hasSatisfiedVerificationSinceLatestWrite
+	        && (toolCalls.length === 0 || executionPhase === "finalize")
+	        && round < maxToolRounds - 1;
+	      // 对共享热路径上的行为修改，这里单独把
+	      // “主目标已经通过，但还没补相邻回归” 拉成显式分支。
+	      //
+	      // 原来它只通过 shouldForceStrongerVerification 间接表达，
+	      // 但那条路径更偏“验证强度不够”的通用提醒。
+	      // 对 requests/adapters.py 这类文件，我们需要更硬的语义：
+	      // - targeted verify 通过，不代表可以 finalize
+	      // - 只要 high-risk shared path 仍未做 adjacent regression，
+	      //   下一轮就必须继续 verify，而不是总结或停在 modify
+	      const shouldForceAdjacentRegressionAfterTargetedVerify =
+	        verificationRequirement.requiredLevel === "behavioral"
+	        && verificationRequirement.requireAdjacentRegression
+	        && modifiedPathsSinceLatestWrite.size > 0
+	        && verificationProgress.hasTargetedBehavioralSuccess
+	        && !verificationProgress.hasAdjacentRegressionSuccess
+	        && (toolCalls.length === 0 || executionPhase === "finalize")
+	        && round < maxToolRounds - 1;
 
       // mixed explain + edit 请求里，如果模型先完成了解释、但还没真正落修改，
       // 这里不要直接把 execute 收尾。
@@ -2043,28 +2603,48 @@ export function createAgentLangGraph(
         continue;
       }
 
-      if (shouldForceSubstantiveBehaviorEdit) {
-        const superficialPaths = [...superficialBehaviorPaths];
-        await service.appendMessage({
-          sessionId: state.sessionId,
-          role: "system",
+	      if (shouldForceSubstantiveBehaviorEdit) {
+	        const superficialPaths = [...superficialBehaviorPaths];
+	        await service.appendMessage({
+	          sessionId: state.sessionId,
+	          role: "system",
           content: createModificationPolicyMessage(
             [
               "当前任务属于行为性修改，但最新补丁还没有命中真实行为路径。",
-              superficialPaths.length > 0
-                ? `目前检测到的改动仍偏表层：${superficialPaths.join("、")}（只改了 import/comment/轻量整理）。`
-                : "目前检测到的改动仍偏表层，没有看到真实函数体/条件分支/异常映射上的改动。",
-              "下一轮必须继续 modify，在函数体、条件分支、异常映射、返回值或参数处理等真实行为路径上发起 edit/write。",
-            ].join("\n"),
-          ),
-        });
-        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
-        continue;
-      }
+	              superficialPaths.length > 0
+	                ? `目前检测到的改动仍偏表层：${superficialPaths.join("、")}（只改了 import/comment/轻量整理）。`
+	                : "目前检测到的改动仍偏表层，没有看到真实函数体/条件分支/异常映射上的改动。",
+	              highRiskSuperficialBehaviorPaths.length > 0
+	                ? `其中 ${highRiskSuperficialBehaviorPaths.join("、")} 属于共享热路径，不能让 import/comment 级补丁长期占住 modify phase。`
+	                : undefined,
+	              formatVerificationRequirement(verificationRequirement),
+	              "下一轮必须继续 modify，在函数体、条件分支、异常映射、返回值或参数处理等真实行为路径上发起 edit/write。",
+	            ].join("\n"),
+	          ),
+	        });
+	        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+	        continue;
+	      }
 
-      if (shouldForceVerificationBeforeFinalize) {
-        await service.appendMessage({
-          sessionId: state.sessionId,
+	      if (shouldForceTargetBehaviorHit) {
+	        await service.appendMessage({
+	          sessionId: state.sessionId,
+	          role: "system",
+	          content: createModificationPolicyMessage(
+	            [
+	              "当前任务已经进入行为修复阶段，但最新补丁还没有命中目标代码路径或目标函数体。",
+	              formatVerificationRequirement(verificationRequirement),
+	              "下一轮必须继续 modify，并把 edit/write 明确落到上述目标代码路径里的真实函数体、条件分支或异常映射上。",
+	            ].join("\n"),
+	          ),
+	        });
+	        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+	        continue;
+	      }
+
+	      if (shouldForceVerificationBeforeFinalize) {
+	        await service.appendMessage({
+	          sessionId: state.sessionId,
           role: "system",
           content: createVerificationPolicyMessage(
             [
@@ -2073,13 +2653,29 @@ export function createAgentLangGraph(
             ].join("\n"),
           ),
         });
-        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
-        continue;
-      }
+	        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+	        continue;
+	      }
 
-      if (shouldForceRetryAfterFailedVerification) {
-        await service.appendMessage({
-          sessionId: state.sessionId,
+	      if (shouldForceReturnToTargetPathAfterFailedVerification) {
+	        await service.appendMessage({
+	          sessionId: state.sessionId,
+	          role: "system",
+	          content: createModificationPolicyMessage(
+	            [
+	              "最近一次 verify 在最新补丁之后失败了。不要继续 finalize，也不要继续停在 verify。",
+	              "下一轮必须回到目标代码路径继续 modify，修正真实行为路径后再重新验证。",
+	              formatVerificationRequirement(verificationRequirement),
+	            ].join("\n"),
+	          ),
+	        });
+	        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+	        continue;
+	      }
+
+	      if (shouldForceRetryAfterFailedVerification) {
+	        await service.appendMessage({
+	          sessionId: state.sessionId,
           role: "system",
           content: createVerificationPolicyMessage(
             [
@@ -2088,9 +2684,25 @@ export function createAgentLangGraph(
             ].join("\n"),
           ),
         });
-        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
-        continue;
-      }
+	        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+	        continue;
+	      }
+
+	      if (shouldForceAdjacentRegressionAfterTargetedVerify) {
+	        await service.appendMessage({
+	          sessionId: state.sessionId,
+	          role: "system",
+	          content: createVerificationPolicyMessage(
+	            [
+	              "主目标验证已经通过，但当前修改命中了高风险共享路径，仍缺少一次相邻回归验证。",
+	              "不要 finalize；下一轮必须继续 verify，优先跑同文件或同模块的邻近回归，再决定是否收尾。",
+	              formatVerificationRequirement(verificationRequirement),
+	            ].join("\n"),
+	          ),
+	        });
+	        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+	        continue;
+	      }
 
       if (shouldForceStrongerVerification) {
         await service.appendMessage({
@@ -2215,14 +2827,30 @@ export function createAgentLangGraph(
         if (toolCall.name === "edit" || toolCall.name === "write") {
           const modificationAnalysis = analyzeWriteLikeModification(toolCall);
           if (modificationAnalysis) {
+            if (writeLikeToolCallIsSuperficialBehaviorPatch(toolCall, verificationRequirement)) {
+              await service.appendMessage({
+                sessionId: state.sessionId,
+                role: "system",
+                content: createModificationPolicyMessage(
+                  explainSuperficialBehaviorPatchViolation(
+                    verificationRequirement,
+                    modificationAnalysis,
+                  ),
+                ),
+              });
+              continue;
+            }
+
             const modificationBudget = buildModificationBudget(
               runtimeState,
               state.userMessage,
               modificationAnalysis,
             );
+            const targetsBehavior = writeLikeToolCallTargetsBehavior(toolCall, verificationRequirement);
             const budgetViolation = explainModificationBudgetViolation(
               modificationBudget,
               modificationAnalysis,
+              targetsBehavior,
             );
 
             if (budgetViolation) {
@@ -2261,29 +2889,36 @@ export function createAgentLangGraph(
         if (result.ok) {
           lastSuccessfulToolCallKey = toolCallKey;
           if (toolCall.name === "edit" || toolCall.name === "write") {
-            executedWriteLikeTool = true;
-            if (toolPath) {
-              modifiedPathsSinceLatestWrite.add(toolPath);
-            }
-            const modificationAnalysis = analyzeWriteLikeModification(toolCall);
-            if (modificationAnalysis?.substantialCodeChange) {
-              hasSubstantiveBehavioralEdit = true;
-              if (modificationAnalysis.path) {
-                superficialBehaviorPaths.delete(modificationAnalysis.path);
-              }
-            } else if ((modificationAnalysis?.documentationOnly || modificationAnalysis?.importOnly) && modificationAnalysis.path) {
-              superficialBehaviorPaths.add(modificationAnalysis.path);
-            }
-            if (modificationAnalysis?.highRisk && modificationAnalysis.path) {
-              highRiskModifiedPaths.add(modificationAnalysis.path);
-            }
-            verificationProgress = {
-              attempted: false,
-              latestAttemptFailed: false,
-              strongestSuccessfulLevel: "none",
+	            executedWriteLikeTool = true;
+	            if (toolPath) {
+	              modifiedPathsSinceLatestWrite.add(toolPath);
+	            }
+	            const modificationAnalysis = analyzeWriteLikeModification(toolCall);
+	            if (modificationAnalysis?.substantialCodeChange) {
+	              hasSubstantiveBehavioralEdit = true;
+	              if (modificationAnalysis.path) {
+	                superficialBehaviorPaths.delete(modificationAnalysis.path);
+	              }
+	            } else if ((modificationAnalysis?.documentationOnly || modificationAnalysis?.importOnly) && modificationAnalysis.path) {
+	              superficialBehaviorPaths.add(modificationAnalysis.path);
+	            }
+	            if (modificationAnalysis?.sharedHotPath && modificationAnalysis.path) {
+	              sharedHotModifiedPaths.add(modificationAnalysis.path);
+	            }
+	            if (modificationAnalysis?.highRisk && modificationAnalysis.path) {
+	              highRiskModifiedPaths.add(modificationAnalysis.path);
+	            }
+	            if (writeLikeToolCallTargetsBehavior(toolCall, verificationRequirement)) {
+	              hasTargetBehaviorEdit = true;
+	            }
+	            verificationProgress = {
+	              attempted: false,
+	              latestAttemptFailed: false,
+	              strongestSuccessfulLevel: "none",
               hasTargetedBehavioralSuccess: false,
               hasAdjacentRegressionSuccess: false,
             };
+            latestVerificationFailure = undefined;
           }
 
           if (toolCall.name === "grep") {
@@ -2291,7 +2926,8 @@ export function createAgentLangGraph(
           }
 
           if (toolCall.name === "bash") {
-            const verificationAnalysis = analyzeVerificationCommand(readBashCommand(toolCall.input));
+            const command = readBashCommand(toolCall.input);
+            const verificationAnalysis = analyzeVerificationCommand(command);
             if (verificationAnalysis) {
               const exitCode = readBashExitCode(result.output);
               if ((exitCode ?? 1) === 0) {
@@ -2309,12 +2945,14 @@ export function createAgentLangGraph(
                     verificationProgress.hasAdjacentRegressionSuccess
                     || (verificationAnalysis.level === "behavioral" && verificationAnalysis.adjacentRegression),
                 };
+                latestVerificationFailure = undefined;
               } else {
                 verificationProgress = {
                   ...verificationProgress,
                   attempted: true,
                   latestAttemptFailed: true,
                 };
+                latestVerificationFailure = parseVerificationFailureFeedback(result.output, workspace.path);
               }
             }
           }
@@ -2343,6 +2981,17 @@ export function createAgentLangGraph(
           role: "tool",
           content: summarizeToolResult(toolCall, result),
         });
+
+        if (result.ok && toolCall.name === "bash" && latestVerificationFailure) {
+          await service.appendMessage({
+            sessionId: state.sessionId,
+            role: "system",
+            content: createVerificationFeedbackMessage(
+              latestVerificationFailure,
+              readBashCommand(toolCall.input),
+            ),
+          });
+        }
       }
 
       runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;

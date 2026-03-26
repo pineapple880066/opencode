@@ -277,12 +277,32 @@ function normalizeEditInput(input: EditInput): EditInput {
     search:
       pickStringAlias(
         input,
-        ["search", "search_replace", "searchReplace", "old_string", "oldString", "old_text", "oldText"],
+        [
+          "search",
+          "search_replace",
+          "searchReplace",
+          "searchreplace",
+          "old_string",
+          "oldString",
+          "old_text",
+          "oldText",
+          "oldtext",
+        ],
       ) ?? input.search,
     replace:
       pickStringAlias(
         input,
-        ["replace", "new_content", "newContent", "new_string", "newString", "new_text", "newText"],
+        [
+          "replace",
+          "new_content",
+          "newContent",
+          "newcontent",
+          "new_string",
+          "newString",
+          "new_text",
+          "newText",
+          "newtext",
+        ],
       ) ?? input.replace,
     replaceAll:
       pickBooleanAlias(input, ["replaceAll", "replace_all"]) ??
@@ -594,13 +614,13 @@ async function editTool(input: EditInput): Promise<EditOutput> {
 
   if (typeof normalizedInput.search !== "string" || normalizedInput.search.length === 0) {
     throw new Error(
-      "edit.search 不能为空；兼容字段可使用 search、search_replace、searchReplace、old_string、oldString、old_text 或 oldText",
+      "edit.search 不能为空；兼容字段可使用 search、search_replace、searchReplace、searchreplace、old_string、oldString、old_text、oldText 或 oldtext",
     );
   }
 
   if (typeof normalizedInput.replace !== "string") {
     throw new Error(
-      "edit.replace 不能为空；兼容字段可使用 replace、new_content、newContent、new_string、newString、new_text 或 newText",
+      "edit.replace 不能为空；兼容字段可使用 replace、new_content、newContent、newcontent、new_string、newString、new_text、newText 或 newtext",
     );
   }
 

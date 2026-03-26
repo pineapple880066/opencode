@@ -422,10 +422,21 @@ async function ensureRepositoryCache(repo: string, cacheRoot: string): Promise<s
       timeoutMs: 10 * 60 * 1000,
     });
   } else {
-    await runCommand("git", ["fetch", "--prune", "origin"], {
-      cwd: cacheDir,
-      timeoutMs: 10 * 60 * 1000,
-    });
+    try {
+      await runCommand("git", ["fetch", "--prune", "origin"], {
+        cwd: cacheDir,
+        timeoutMs: 10 * 60 * 1000,
+      });
+    } catch (error) {
+      // benchmark rerun 不应该因为“已有 cache 的一次 refresh 失败”就整条实例直接判死。
+      // 这里的原则是：
+      // - 如果本地 cache 已存在，就优先复用
+      // - 真正必须失败的条件是：后面需要的 base_commit 在 cache 里也找不到
+      // 这样网络抖动时，runner 仍然可以离线复现之前已经缓存过的实例。
+      console.warn(
+        `[swebench-lite] 仓库 cache refresh 失败，改为继续复用本地 cache: ${repo}\n${(error as Error).message}`,
+      );
+    }
   }
 
   return cacheDir;

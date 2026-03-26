@@ -1278,6 +1278,7 @@ export function createMiniMaxHooks(options?: MiniMaxHooksOptions): LangGraphHook
           "如果当前修改看起来不涉及行为变化，比如只做重排、重命名或结构性整理，那么最小结构性验证通常就够了，例如 git diff --check、语法检查、类型检查、lint 或最小 build。",
           "如果 runtimeState.recentToolInvocations 里已经有刚刚完成的相同工具调用，不要重复同一个 name/path；你必须基于已有结果继续下一步。",
           "如果最近消息里出现 LOOP_GUARD，说明你已经在重复同一个工具调用了；下一轮必须改用 edit/write，或者直接输出最终 assistantMessage。",
+          "如果最近消息里出现 VERIFICATION_FEEDBACK，说明 runtime 已经把失败测试、目标代码路径、行为锚点和断言线索结构化出来了；下一轮必须优先围绕这些信号继续 modify/verify，不要回头读无关文件。",
           "当最近消息里已经有 tool=... 的工具结果时，你要基于这些结果决定下一轮 toolCalls，或者给出最终 assistantMessage。",
           "如果你已经能明确说出“要改哪个文件、哪段函数、哪行附近”或者已经拿到了可替换锚点，下一轮就必须进入 modify phase 并发起 edit/write；不要继续纯 explain。",
           "如果你已经 view 过同一个文件，还继续对同一路径发纯只读 toolCalls，会被 runtime 视为拖延修改；请直接 edit/write。",
