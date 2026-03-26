@@ -22,3 +22,5 @@ export const PERSISTENCE_SMOKE_EXPECTATIONS = [
   "真实 Redis 可以连接并服务 session summary cache。",
   "LangGraph invoke 之后会把 durable checkpoint 写入 MySQL。",
 ] as const;
+
+export * from "./swebench-lite.js";

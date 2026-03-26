@@ -20,7 +20,7 @@ const minimaxEnvSchema = z.object({
 const planStatusValues = ["draft", "ready", "in_progress", "completed", "failed"] as const;
 const taskStatusValues = ["todo", "in_progress", "blocked", "done", "canceled"] as const;
 const agentModeValues = ["build", "plan", "explore", "review", "general"] as const;
-const modelToolNameValues = ["list", "view", "grep", "write", "edit"] as const;
+const modelToolNameValues = ["list", "view", "grep", "write", "edit", "bash"] as const;
 const memoryScopeValues = ["session", "workspace", "user"] as const;
 const memorySourceValues = ["user", "assistant", "system", "tool", "review"] as const;
 
@@ -607,12 +607,18 @@ const executorSchema = z.object({
         edit: "modify",
         write: "modify",
         patch: "modify",
+        verify: "verify",
+        verification: "verify",
+        validate: "verify",
+        validation: "verify",
+        test: "verify",
+        checking: "verify",
         finalize: "finalize",
         final: "finalize",
         summarize: "finalize",
         summary: "finalize",
       }),
-    z.enum(["explain", "modify", "finalize"]),
+    z.enum(["explain", "modify", "verify", "finalize"]),
   ).optional(),
   assistantMessage: z.string().min(1).max(2000).optional(),
   tasks: z
@@ -824,42 +830,80 @@ function previewToolInvocationOutputForDigest(
   return previewJsonString(log.outputJson, 600);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function isRetryableMiniMaxFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  if (error.name === "AbortError") {
+    return true;
+  }
+
+  if (/MiniMax request failed:\s*(408|409|425|429|500|502|503|504)\b/.test(error.message)) {
+    return true;
+  }
+
+  return /fetch failed|network error|socket hang up|ECONNRESET|ETIMEDOUT/i.test(error.message);
+}
+
 async function requestMiniMaxContent(
   config: MiniMaxConfig,
   fetchImpl: FetchLike,
   messages: MiniMaxChatMessage[],
 ): Promise<string> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, config.timeoutMs);
+  let lastError: unknown;
 
-  try {
-    const response = await fetchImpl(`${trimTrailingSlash(config.baseUrl)}/chat/completions`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${config.apiKey}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: config.model,
-        messages,
-        temperature: config.temperature,
-        reasoning_split: true,
-      }),
-      signal: controller.signal,
-    });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, config.timeoutMs);
 
-    const rawText = await response.text();
-    if (!response.ok) {
-      throw new Error(`MiniMax request failed: ${response.status} ${rawText}`);
+    try {
+      const response = await fetchImpl(`${trimTrailingSlash(config.baseUrl)}/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${config.apiKey}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages,
+          temperature: config.temperature,
+          reasoning_split: true,
+        }),
+        signal: controller.signal,
+      });
+
+      const rawText = await response.text();
+      if (!response.ok) {
+        throw new Error(`MiniMax request failed: ${response.status} ${rawText}`);
+      }
+
+      const payload = JSON.parse(rawText) as MiniMaxChatCompletionResponse;
+      return extractMessageContent(payload);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= 2 || !isRetryableMiniMaxFailure(error)) {
+        throw error;
+      }
+
+      // benchmark/headless 批处理里，一次瞬时 500 就直接打断整条实例代价太高。
+      // 这里把 provider 级重试限制在少量瞬时错误，避免把 schema 脏数据之类的
+      // 确定性问题也一起吞掉。
+      await sleep(400 * (attempt + 1));
+    } finally {
+      clearTimeout(timeout);
     }
-
-    const payload = JSON.parse(rawText) as MiniMaxChatCompletionResponse;
-    return extractMessageContent(payload);
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw lastError instanceof Error ? lastError : new Error("MiniMax request failed");
 }
 
 function buildStateDigest(state: AgentGraphState): string {
@@ -1215,23 +1259,28 @@ export function createMiniMaxHooks(options?: MiniMaxHooksOptions): LangGraphHook
         [
           "请基于当前 runtimeState 输出执行结果草案。",
           "输出字段：executionPhase、assistantMessage、tasks、memory、toolCalls。",
-          "executionPhase 只能是：explain、modify、finalize。",
+          "executionPhase 只能是：explain、modify、verify、finalize。",
           "tasks 用于同步 runtime task 账本；如果在更新已有 task，尽量复用现有 task id。",
           "task.status 只能是：todo、in_progress、blocked、done、canceled。",
           "memory.scope 只能是：session、workspace、user。",
           "memory.source 只能是：user、assistant、system、tool、review。",
           "如果需要真实读写工作区文件，必须通过 toolCalls 请求工具，不要谎称已经改好了代码。",
-          "toolCalls.name 只能是：list、view、grep、write、edit。",
-          "toolCalls.input 里只写相对工作区的 path，不要写绝对路径，也不要自己传 root。",
-          "phase 规划规则：读懂/解释文件时用 explain；开始落改动时用 modify；给最终自然语言答复时用 finalize。",
+          "toolCalls.name 只能是：list、view、grep、write、edit、bash。",
+          "toolCalls.input 里只写相对工作区的 path；如果是 bash，使用 cwd + command；不要写绝对路径，也不要自己传 root。",
+          "phase 规划规则：读懂/解释文件时用 explain；开始落改动时用 modify；修改后跑最小验证时用 verify；给最终自然语言答复时用 finalize。",
           "view 默认会返回整个文件；如果你只需要局部片段，优先传 startLine/endLine，也兼容 offset/limit 或 lineRange: \"1-80\"。",
           "读取文件前优先用 view；小改动优先用 edit；只有在你已经看过文件并且确定要整体覆盖时才用 write。",
+          "如果需要运行最小验证命令、测试、typecheck、lint、build 或 git diff --check，优先在 verify phase 请求 bash。",
           "如果 runtimeState.recentToolInvocations 里已经有刚刚完成的相同工具调用，不要重复同一个 name/path；你必须基于已有结果继续下一步。",
           "如果最近消息里出现 LOOP_GUARD，说明你已经在重复同一个工具调用了；下一轮必须改用 edit/write，或者直接输出最终 assistantMessage。",
           "当最近消息里已经有 tool=... 的工具结果时，你要基于这些结果决定下一轮 toolCalls，或者给出最终 assistantMessage。",
+          "如果你已经能明确说出“要改哪个文件、哪段函数、哪行附近”或者已经拿到了可替换锚点，下一轮就必须进入 modify phase 并发起 edit/write；不要继续纯 explain。",
+          "如果你已经 view 过同一个文件，还继续对同一路径发纯只读 toolCalls，会被 runtime 视为拖延修改；请直接 edit/write。",
           "reread policy：完整 view 之后，最多只允许 1 次 focused reread；而且这次 reread 必须带新的范围，并且仍处于 explain phase。",
           "一旦进入 modify phase，不要再回头 reread 同一个文件；你应该直接 edit/write，或者结束。",
           "像“先解释这个测试文件在测什么，再加两行注释”这种混合请求，推荐 phase 顺序是 explain -> modify -> finalize。",
+          "像“修 bug / 调默认值 / 改参数 / 修测试 / 生成 patch”这种行为性改动，推荐 phase 顺序是 explain -> modify -> verify -> finalize。",
+          "如果任务目标是修 bug、改默认值、调整参数、修测试或生成 patch，那么没有任何 edit/write 成功前不要 finalize；有真实改动后、在没有做过最小验证前也不要 finalize。",
           "如果你正在请求 toolCalls，assistantMessage 一般应省略；不要反复输出“正在读取文件”“准备修改文件”这类中间态废话。",
           "如果复用已有 task id，title 和 inputSummary 仍然必须保留非空字符串；补不齐的 task 项就不要输出。",
           "memory.value 必须是非空字符串；补不齐的 memory 项就不要输出。",
@@ -1245,7 +1294,7 @@ export function createMiniMaxHooks(options?: MiniMaxHooksOptions): LangGraphHook
         {
           sanitizer: (value) => sanitizeExecutorCandidate(value, state),
           repairHint:
-            "executionPhase 只能是 explain/modify/finalize。tasks 最多 6 项；每个 task 都必须有非空 title 和 inputSummary；如果只想更新已有 task，也必须保留这两个字段；补不齐的 task 项不要输出。memory 最多 6 项；每个 memory 都必须有非空 key 和 value；memory.scope 只能是 session/workspace/user，memory.source 只能是 user/assistant/system/tool/review。toolCalls 最多 4 项；toolCalls.name 只能是 list/view/grep/write/edit；toolCalls.input 必须是 JSON object。",
+            "executionPhase 只能是 explain/modify/verify/finalize。tasks 最多 6 项；每个 task 都必须有非空 title 和 inputSummary；如果只想更新已有 task，也必须保留这两个字段；补不齐的 task 项不要输出。memory 最多 6 项；每个 memory 都必须有非空 key 和 value；memory.scope 只能是 session/workspace/user，memory.source 只能是 user/assistant/system/tool/review。toolCalls 最多 4 项；toolCalls.name 只能是 list/view/grep/write/edit/bash；toolCalls.input 必须是 JSON object。",
         },
       ),
     reviewer: async (state, input) =>

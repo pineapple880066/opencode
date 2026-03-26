@@ -15,7 +15,9 @@
     "infra:logs": "docker compose logs -f mysql redis",
     "infra:ps": "docker compose ps -a",
     "smoke:minimax": "tsx packages/evals/src/minimax-smoke.ts",
-    "smoke:persistence": "tsx packages/evals/src/persistence-smoke.ts"
+    "smoke:persistence": "tsx packages/evals/src/persistence-smoke.ts",
+    "bench:swebench:export": "python3 packages/evals/scripts/export_swebench_lite_subset.py",
+    "bench:swebench:lite": "tsx packages/evals/src/swebench-lite.ts"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

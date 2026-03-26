@@ -258,6 +258,69 @@ describe("RuntimeToolExecutor", () => {
     assert.equal(viewResult.output?.content, ["beta", "gamma"].join("\n"));
   });
 
+  test("build 模式的 grep 工具兼容 pattern/keyword 别名，并且可以直接搜索单文件路径", async () => {
+    const store = new InMemoryRuntimeStore();
+    store.sessionMap.set("session_grep_pattern_alias", {
+      id: "session_grep_pattern_alias",
+      workspaceId: "workspace_1",
+      title: "grep pattern alias session",
+      status: "active",
+      activeAgentMode: "build",
+      summary: {
+        shortSummary: "",
+        openLoops: [],
+        nextActions: [],
+        importantFacts: [],
+      } satisfies SessionSummary,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const filePath = path.join(workspaceRoot, "notes", "grep-file.ts");
+    await writeFile(
+      filePath,
+      [
+        "export function fromFile(path: string) {",
+        "  return path;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const executor = new RuntimeToolExecutor(store, createBuiltinToolRegistry());
+    const grepResult = await executor.execute<any, { query: string; matches: Array<{ path: string; line: number; content: string }> }>({
+      sessionId: "session_grep_pattern_alias",
+      name: "grep",
+      input: {
+        root: workspaceRoot,
+        path: "notes/grep-file.ts",
+        pattern: "fromFile",
+      },
+    });
+
+    assert.equal(grepResult.ok, true);
+    assert.equal(grepResult.output?.query, "fromFile");
+    assert.equal(grepResult.output?.matches.length, 1);
+    assert.equal(grepResult.output?.matches[0]?.path, "notes/grep-file.ts");
+    assert.equal(grepResult.output?.matches[0]?.line, 1);
+    assert.match(grepResult.output?.matches[0]?.content ?? "", /fromFile/);
+
+    const grepByKeyword = await executor.execute<any, { query: string; matches: Array<{ path: string }> }>({
+      sessionId: "session_grep_pattern_alias",
+      name: "grep",
+      input: {
+        root: workspaceRoot,
+        path: "notes",
+        keyword: "fromFile",
+      },
+    });
+
+    assert.equal(grepByKeyword.ok, true);
+    assert.equal(grepByKeyword.output?.query, "fromFile");
+    assert.equal(grepByKeyword.output?.matches[0]?.path, "notes/grep-file.ts");
+  });
+
   test("plan 模式会真实拒绝写工具", async () => {
     const store = new InMemoryRuntimeStore();
     store.sessionMap.set("session_plan", {
@@ -343,6 +406,42 @@ describe("RuntimeToolExecutor", () => {
     assert.match(bashResult.output?.stdout ?? "", /agent-ide-tools-/);
   });
 
+  test("build 模式的 bash 工具兼容 cmd / working_directory / timeout_ms 这类外部参数风格", async () => {
+    const store = new InMemoryRuntimeStore();
+    store.sessionMap.set("session_bash_aliases", {
+      id: "session_bash_aliases",
+      workspaceId: "workspace_1",
+      title: "bash alias session",
+      status: "active",
+      activeAgentMode: "build",
+      summary: {
+        shortSummary: "",
+        openLoops: [],
+        nextActions: [],
+        importantFacts: [],
+      } satisfies SessionSummary,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const executor = new RuntimeToolExecutor(store, createBuiltinToolRegistry());
+    const bashResult = await executor.execute<any, { stdout: string; cwd: string }>({
+      sessionId: "session_bash_aliases",
+      name: "bash",
+      approvalGranted: true,
+      input: {
+        root: workspaceRoot,
+        cmd: "pwd",
+        working_directory: ".",
+        timeout_ms: 5_000,
+      },
+    });
+
+    assert.equal(bashResult.ok, true);
+    assert.equal(bashResult.output?.cwd, ".");
+    assert.match(bashResult.output?.stdout ?? "", /agent-ide-tools-/);
+  });
+
   test("build 模式的 edit 工具兼容 file_path 和 oldString/newString 这类外部 agent 参数风格", async () => {
     const store = new InMemoryRuntimeStore();
     store.sessionMap.set("session_edit_aliases", {
@@ -391,5 +490,51 @@ describe("RuntimeToolExecutor", () => {
     const updatedContent = await readFile(filePath, "utf8");
     assert.match(updatedContent, /Add two comment lines as requested/);
     assert.match(updatedContent, /This is a simple test modification/);
+  });
+
+  test("build 模式的 edit 工具兼容 oldText/newText 这类另一组外部 agent 参数风格", async () => {
+    const store = new InMemoryRuntimeStore();
+    store.sessionMap.set("session_edit_text_aliases", {
+      id: "session_edit_text_aliases",
+      workspaceId: "workspace_1",
+      title: "edit text alias session",
+      status: "active",
+      activeAgentMode: "build",
+      summary: {
+        shortSummary: "",
+        openLoops: [],
+        nextActions: [],
+        importantFacts: [],
+      } satisfies SessionSummary,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const filePath = path.join(workspaceRoot, "notes", "alias-text-test.ts");
+    await writeFile(
+      filePath,
+      [
+        "export const DEFAULT_LOG_FORMAT = \"%(filename)-25s %(lineno)4d %(levelname)-8s %(message)s\";",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const executor = new RuntimeToolExecutor(store, createBuiltinToolRegistry());
+    const result = await executor.execute({
+      sessionId: "session_edit_text_aliases",
+      name: "edit",
+      input: {
+        root: workspaceRoot,
+        file_path: "notes/alias-text-test.ts",
+        oldText: "\"%(filename)-25s %(lineno)4d %(levelname)-8s %(message)s\"",
+        newText: "\"%(levelname)-8s %(name)s:%(filename)s:%(lineno)d %(message)s\"",
+      },
+    });
+
+    assert.equal(result.ok, true);
+
+    const updatedContent = await readFile(filePath, "utf8");
+    assert.match(updatedContent, /%\((name)\)s:%\((filename)\)s:%\((lineno)\)d/);
   });
 });

@@ -24,6 +24,7 @@
 - `MiniMax` hooks 适配层已经存在，可以把外部模型挂到 `LangGraphHooks`
 - 工作区级 `.env / .env.local` 自动加载已经接好，`smoke` 和 `dev-server` 会直接吃当前仓库配置
 - `compose.yaml` 和 `pnpm infra:*` 已经把本地 `MySQL + Redis` 起服务这件事固化进仓库
+- `packages/evals/src/swebench-lite.ts` 和 `packages/evals/scripts/export_swebench_lite_subset.py` 已经把 SWE-bench Lite baseline 跑法固化进仓库：可以导出实例、准备工作区、headless 跑 agent，并收集 `predictions.json`
 
 现在还没有的是：
 
@@ -190,6 +191,24 @@
 - 为什么 `.env` 会同时被应用脚本和 compose 复用
 
 如果你现在最想做的是把本地依赖先起起来，再跑 smoke，这两份文件就是第一入口。
+
+### 6.2 如果你现在想跑 benchmark
+
+先读：
+
+- `docs/swebench-lite.md`
+- `packages/evals/src/swebench-lite.ts`
+- `packages/evals/scripts/export_swebench_lite_subset.py`
+
+为什么这一组值得单独看：
+
+它们把 “SWE-bench Lite 的前 5 条怎么在当前仓库里跑起来” 这条链单独固化了：
+
+- 实例怎么导出
+- repo 基线工作区怎么准备
+- 为什么 benchmark 不走浏览器 UI，而是 headless runner
+- predictions.json 怎么生成
+- 官方 harness 怎么接
 
 ### 6.5 单独把 LangGraph 持久化看一遍
 

@@ -536,6 +536,7 @@ describe("AgentLangGraphRuntime", () => {
 
       let sequence = 0;
       let executorCallCount = 0;
+      let scriptedStep = 0;
       const service = new GoalDrivenRuntimeService(store, {
         now: () => now,
         createId: (prefix: string) => `${prefix}_${++sequence}`,
@@ -741,6 +742,7 @@ describe("AgentLangGraphRuntime", () => {
 
       let sequence = 0;
       let executorCallCount = 0;
+      let scriptedStep = 0;
       const service = new GoalDrivenRuntimeService(store, {
         now: () => now,
         createId: (prefix: string) => `${prefix}_${++sequence}`,
@@ -960,6 +962,7 @@ describe("AgentLangGraphRuntime", () => {
 
       let sequence = 0;
       let executorCallCount = 0;
+      let scriptedStep = 0;
       const service = new GoalDrivenRuntimeService(store, {
         now: () => now,
         createId: (prefix: string) => `${prefix}_${++sequence}`,
@@ -1538,6 +1541,1128 @@ describe("AgentLangGraphRuntime", () => {
         messages.some(
           (message) =>
             message.role === "assistant" && message.content.includes("已经先解释测试内容，再补上两行注释"),
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("mixed explain + edit 请求里，即使模型声称进入 modify phase，但没有发 edit/write，runtime 仍会继续追 modify", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-empty-modify-phase-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "browser.test.ts");
+      await writeFile(
+        targetPath,
+        [
+          "import assert from \"node:assert/strict\";",
+          "import { describe, test } from \"node:test\";",
+          "",
+          "describe(\"ide browser runtime\", () => {",
+          "  test(\"works\", () => {",
+          "    assert.equal(1, 1);",
+          "  });",
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-25T11:20:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_empty_modify_phase",
+        path: tempRoot,
+        label: "empty-modify-phase",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_empty_modify_phase",
+        workspaceId: workspace.id,
+        title: "empty modify phase session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        hooks: {
+          goalFactory: async () => ({
+            title: "modify phase 不能空转",
+            description: "如果模型说自己进入 modify phase，但没有真的发 edit/write，runtime 仍要继续追到真实修改。",
+            successCriteria: ["空 modify phase 不会直接收尾", "后续会真实 edit 文件"],
+          }),
+          planner: async () => ({
+            summary: "先读文件，再模拟一个空 modify phase，最后真正 edit。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_view",
+                title: "读取文件",
+                description: "拿到文件上下文。",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_edit",
+                title: "补注释",
+                description: "真的修改文件。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const sawView = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=view"),
+            );
+            const sawPolicyNudge = state.messages.some(
+              (message) =>
+                message.role === "system"
+                && message.content.includes("EXECUTION_POLICY: 用户请求同时包含解释和修改"),
+            );
+            const sawEdit = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=edit"),
+            );
+
+            if (!sawView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view",
+                    reasoning: "先读取文件。",
+                    input: {
+                      path: "browser.test.ts",
+                      startLine: 1,
+                      endLine: 8,
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawPolicyNudge) {
+              return {
+                executionPhase: "modify",
+                assistantMessage: "我已经知道要改文件顶部 import 之前，但这轮故意不发 edit。",
+                tasks: [
+                  {
+                    id: "plan_step_view",
+                    title: "读取文件",
+                    inputSummary: "拿到文件上下文。",
+                    outputSummary: "已经知道 import 顶部是修改锚点。",
+                    status: "done",
+                  },
+                ],
+              };
+            }
+
+            if (!sawEdit) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_edit",
+                    reasoning: "runtime 已经追了 modify，这一轮必须真实改文件。",
+                    input: {
+                      path: "browser.test.ts",
+                      search: "import assert from \"node:assert/strict\";",
+                      replace:
+                        "// 这里补一行注释，验证空 modify phase 不会直接收尾。\nimport assert from \"node:assert/strict\";",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "空 modify phase 已被 runtime 继续追到真实 edit。",
+              tasks: [
+                {
+                  id: "plan_step_edit",
+                  title: "补注释",
+                  inputSummary: "真的修改文件。",
+                  outputSummary: "空 modify phase 之后，runtime 继续推进到了真实 edit。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["模型虽然一度空转在 modify phase，但 runtime 最终仍推进到了真实 edit。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "空 modify phase 不会让 runtime 提前收尾",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["modify phase 必须对应真实 edit/write，不能只说不做"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage: "先看看这个文件，然后补一行注释。",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /空 modify phase 不会直接收尾/);
+      assert.equal(executorCallCount, 4);
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "assistant"
+            && message.content.includes("这轮故意不发 edit"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("EXECUTION_POLICY: 用户请求同时包含解释和修改"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "assistant"
+            && message.content.includes("空 modify phase 已被 runtime 继续追到真实 edit"),
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("像 'Add a text parameter' 这类新增需求也会被视为待修改工作，不能在 explain 后提前收尾", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-add-parameter-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "config.py");
+      await writeFile(
+        targetPath,
+        [
+          "def from_file(filename, load):",
+          "    with open(filename) as f:",
+          "        return load(f)",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-25T10:50:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_add_parameter",
+        path: tempRoot,
+        label: "add-parameter",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_add_parameter",
+        workspaceId: workspace.id,
+        title: "add parameter session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        hooks: {
+          goalFactory: async () => ({
+            title: "Add a text parameter to from_file",
+            description: "先读取 config.py，再为 from_file 添加 text 参数支持。",
+            successCriteria: ["会定位 from_file", "会真实修改函数签名和 open 模式"],
+          }),
+          planner: async () => ({
+            summary: "Add a text parameter to from_file and use it to choose the file mode.",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_read",
+                title: "Read the target function",
+                description: "Locate from_file in config.py.",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_add_parameter",
+                title: "Add a text parameter",
+                description: "Change signature and open mode for binary/text loaders.",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const sawView = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=view"),
+            );
+            const sawPolicyNudge = state.messages.some(
+              (message) =>
+                message.role === "system" &&
+                message.content.includes("EXECUTION_POLICY: 用户请求同时包含解释和修改"),
+            );
+            const sawEdit = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=edit"),
+            );
+
+            if (!sawView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_read",
+                    reasoning: "先读完整函数内容。",
+                    input: {
+                      path: "config.py",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawPolicyNudge) {
+              return {
+                executionPhase: "finalize",
+                assistantMessage: "已经定位到 from_file，接下来理论上可以添加参数。",
+                tasks: [
+                  {
+                    id: "plan_step_read",
+                    title: "Read the target function",
+                    inputSummary: "Locate from_file in config.py.",
+                    outputSummary: "已完成定位。",
+                    status: "done",
+                  },
+                ],
+              };
+            }
+
+            if (!sawEdit) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_add_parameter",
+                    reasoning: "收到策略提示后，进入真实修改。",
+                    input: {
+                      path: "config.py",
+                      search: "def from_file(filename, load):\n    with open(filename) as f:\n        return load(f)",
+                      replace:
+                        "def from_file(filename, load, text=True):\n    mode = \"r\" if text else \"rb\"\n    with open(filename, mode) as f:\n        return load(f)",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已经添加 text 参数并调整文件打开模式。",
+              tasks: [
+                {
+                  id: "plan_step_add_parameter",
+                  title: "Add a text parameter",
+                  inputSummary: "Change signature and open mode for binary/text loaders.",
+                  outputSummary: "已完成真实修改。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["新增需求被识别为真实修改工作，并且文件已经改动。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "add parameter 请求没有在 explain 后提前收尾",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["Add/parameter 这类措辞也会触发 modify 过渡"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage: "Add a text parameter to from_file so binary parsers can be supported.",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /def from_file\(filename, load, text=True\):/);
+      assert.match(finalContent, /mode = "r" if text else "rb"/);
+      assert.equal(executorCallCount, 5);
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("EXECUTION_POLICY: 用户请求同时包含解释和修改"),
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("行为性修改在真实 edit 后，没有 verify 不会直接 finalize；verify 失败后也不会直接收尾", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-verify-policy-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "app.py");
+      await writeFile(
+        targetPath,
+        [
+          "def greet():",
+          "    return \"hello\"",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-26T09:00:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_verify_policy",
+        path: tempRoot,
+        label: "verify-policy",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_verify_policy",
+        workspaceId: workspace.id,
+        title: "verify policy session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        toolApprovalDecider: ({ toolCall }) => toolCall.name === "bash",
+        maxToolRounds: 8,
+        hooks: {
+          goalFactory: async () => ({
+            title: "修复 greet 的返回值并验证没有回归",
+            description: "修改 app.py 的行为后，需要至少做一次最小验证；如果验证失败，不能直接收尾。",
+            successCriteria: ["真实修改文件", "修改后做最小验证", "验证失败时继续修复或重试"],
+          }),
+          planner: async () => ({
+            summary: "先读取 app.py，再修改，再验证，最后收尾。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_view",
+                title: "读取目标文件",
+                description: "拿到 greet 的当前实现。",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_edit",
+                title: "修改 greet 行为",
+                description: "先故意制造一次需要验证才能发现的问题，再修正它。",
+                status: "todo",
+              },
+              {
+                id: "plan_step_verify",
+                title: "跑最小验证",
+                description: "用 py_compile 验证语法和局部正确性。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const toolMessages = state.messages.filter((message) => message.role === "tool");
+            const systemMessages = state.messages.filter((message) => message.role === "system");
+            const sawView = toolMessages.some((message) => message.content.includes("tool=view"));
+            const editMessages = toolMessages.filter((message) => message.content.includes("tool=edit"));
+            const bashMessages = toolMessages.filter((message) => message.content.includes("tool=bash"));
+            const sawNeedVerifyNudge = systemMessages.some(
+              (message) =>
+                message.content.includes("VERIFICATION_POLICY: 当前 invoke 已经进入真实修改阶段。")
+                && message.content.includes("还没有任何验证尝试"),
+            );
+            const sawFailedVerifyNudge = systemMessages.some(
+              (message) =>
+                message.content.includes("VERIFICATION_POLICY: 当前 invoke 已经进入真实修改阶段。")
+                && message.content.includes("最近一次 verify phase 在最新改动之后失败了"),
+            );
+            const sawFailedVerify = bashMessages.some((message) => message.content.includes("\"exitCode\":1"));
+            const sawSuccessfulVerify = bashMessages.some((message) => message.content.includes("\"exitCode\":0"));
+
+            if (!sawView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view",
+                    reasoning: "先看当前 greet 实现。",
+                    input: {
+                      path: "app.py",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (editMessages.length === 0) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_edit",
+                    reasoning: "先做一次真实修改，但故意留下语法问题，验证 runtime 会继续追 verify/fix。",
+                    input: {
+                      path: "app.py",
+                      search: "def greet():\n    return \"hello\"",
+                      replace: "def greet()\n    return \"hello!\"",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawNeedVerifyNudge) {
+              return {
+                executionPhase: "finalize",
+                assistantMessage: "已经改了 greet，理论上可以收尾。",
+              };
+            }
+
+            if (!sawFailedVerify) {
+              return {
+                executionPhase: "verify",
+                toolCalls: [
+                  {
+                    name: "bash",
+                    taskId: "plan_step_verify",
+                    reasoning: "先跑一次最小语法验证，确认这次修改是否可用。",
+                    input: {
+                      cmd: "python3 -m py_compile app.py",
+                      working_directory: ".",
+                      timeout_ms: 10_000,
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawFailedVerifyNudge) {
+              return {
+                executionPhase: "finalize",
+                assistantMessage: "虽然刚才验证失败了，但我先试着收尾。",
+              };
+            }
+
+            if (editMessages.length === 1) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_edit",
+                    reasoning: "收到失败验证的策略提示后，修复语法错误。",
+                    input: {
+                      path: "app.py",
+                      search: "def greet()\n    return \"hello!\"",
+                      replace: "def greet():\n    return \"hello!\"",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawSuccessfulVerify) {
+              return {
+                executionPhase: "verify",
+                toolCalls: [
+                  {
+                    name: "bash",
+                    taskId: "plan_step_verify",
+                    reasoning: "修完以后再次跑最小验证，确认这次通过。",
+                    input: {
+                      command: "python3 -m py_compile app.py",
+                      cwd: ".",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已经修改 greet，并完成最小验证。",
+              tasks: [
+                {
+                  id: "plan_step_edit",
+                  title: "修改 greet 行为",
+                  inputSummary: "先故意制造一次需要验证才能发现的问题，再修正它。",
+                  outputSummary: "最终修改已经稳定落地。",
+                  status: "done",
+                },
+                {
+                  id: "plan_step_verify",
+                  title: "跑最小验证",
+                  inputSummary: "用 py_compile 验证语法和局部正确性。",
+                  outputSummary: "先失败一次，修复后再次通过。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["runtime 在 edit 后追了 verify，并在失败验证后继续推进了修复。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "行为性修改必须经过 verify phase 才能稳定收尾",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["失败验证后不能直接 finalize"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage: "修复 app.py 里的 greet 返回值，并确认修改后没有语法问题。",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /def greet\(\):/);
+      assert.match(finalContent, /return "hello!"/);
+      assert.equal(executorCallCount, 8);
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("VERIFICATION_POLICY: 当前 invoke 已经进入真实修改阶段。")
+            && message.content.includes("还没有任何验证尝试"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("最近一次 verify phase 在最新改动之后失败了"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.filter(
+          (message) => message.role === "tool" && message.content.includes("tool=bash"),
+        ).length,
+        2,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "assistant"
+            && message.content.includes("已经修改 greet，并完成最小验证"),
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("纯注释修改在真实 edit 后不会被强制进入 verify phase", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-comment-no-verify-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "notes.ts");
+      await writeFile(
+        targetPath,
+        [
+          "export function value() {",
+          "  return 1;",
+          "}",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-26T09:30:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_comment_no_verify",
+        path: tempRoot,
+        label: "comment-no-verify",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_comment_no_verify",
+        workspaceId: workspace.id,
+        title: "comment no verify session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        hooks: {
+          goalFactory: async () => ({
+            title: "给 notes.ts 补两行注释",
+            description: "这次只是纯注释修改，不涉及行为变更。",
+            successCriteria: ["真实修改文件", "不被错误地强制跑验证"],
+          }),
+          planner: async () => ({
+            summary: "读取 notes.ts，再直接补注释并收尾。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_view",
+                title: "读取 notes.ts",
+                description: "看清函数顶部的插入位置。",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_comment",
+                title: "补注释",
+                description: "只做注释修改。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const sawView = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=view"),
+            );
+            const sawEdit = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=edit"),
+            );
+
+            if (!sawView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view",
+                    reasoning: "先看函数顶部。",
+                    input: {
+                      path: "notes.ts",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawEdit) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_comment",
+                    reasoning: "这是纯注释修改，直接落文件。",
+                    input: {
+                      path: "notes.ts",
+                      search: "export function value() {",
+                      replace: "// 这里补两行注释。\n// 这次修改只影响说明文本，不影响行为。\nexport function value() {",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已经补上两行注释。",
+              tasks: [
+                {
+                  id: "plan_step_comment",
+                  title: "补注释",
+                  inputSummary: "只做注释修改。",
+                  outputSummary: "已补两行注释。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["纯注释修改不需要额外 verify phase。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "纯注释修改不会被错误地强制验证",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["documentation-only 修改允许 edit 后直接 finalize"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage: "在 notes.ts 顶部加两行注释说明这个函数的作用。",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /这次修改只影响说明文本，不影响行为/);
+      assert.equal(executorCallCount, 3);
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) => message.role === "system" && message.content.includes("VERIFICATION_POLICY:"),
+        ),
+        false,
+      );
+      assert.equal(
+        messages.some(
+          (message) => message.role === "tool" && message.content.includes("tool=bash"),
+        ),
+        false,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("已经 view 过同一路径后，如果下一轮还想对同一路径继续纯只读，runtime 会强制切到 modify", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-force-modify-after-view-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "browser.test.ts");
+      await writeFile(
+        targetPath,
+        [
+          "import assert from \"node:assert/strict\";",
+          "import { describe, test } from \"node:test\";",
+          "",
+          "describe(\"browser runtime\", () => {",
+          "  test(\"works\", () => {",
+          "    assert.equal(1, 1);",
+          "  });",
+          "});",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-25T10:40:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_force_modify_after_view",
+        path: tempRoot,
+        label: "force-modify-after-view",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_force_modify_after_view",
+        workspaceId: workspace.id,
+        title: "force modify after view session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        hooks: {
+          goalFactory: async () => ({
+            title: "解释后修改测试文件",
+            description: "先定位 browser.test.ts，再直接落注释修改。",
+            successCriteria: ["定位文件", "不要卡在重复只读", "真实修改文件"],
+          }),
+          planner: async () => ({
+            summary: "先 view 一次拿上下文；如果已定位文件，则不要继续同一路径纯只读，直接 edit。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_view",
+                title: "定位 browser.test.ts",
+                description: "确认测试文件内容和可修改锚点。",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_edit",
+                title: "补两行注释",
+                description: "定位到文件后直接编辑。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const sawView = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=view"),
+            );
+            const sawPolicyNudge = state.messages.some(
+              (message) =>
+                message.role === "system"
+                && message.content.includes("不要继续对同一路径发起纯只读 toolCalls"),
+            );
+            const sawEdit = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=edit"),
+            );
+
+            if (!sawView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view",
+                    reasoning: "先读取目标测试文件。",
+                    input: {
+                      path: "browser.test.ts",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawPolicyNudge) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "grep",
+                    taskId: "plan_step_view",
+                    reasoning: "已经知道是 browser.test.ts，但错误地还想继续对同一路径做只读搜索。",
+                    input: {
+                      path: "browser.test.ts",
+                      pattern: "describe|test",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawEdit) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_edit",
+                    reasoning: "收到 EXECUTION_POLICY 后，直接做真实修改。",
+                    input: {
+                      path: "browser.test.ts",
+                      search: "import assert from \"node:assert/strict\";",
+                      replace:
+                        "// 已经定位到目标测试文件。\n// 这里验证 runtime 会在已知路径后强制进入 edit。\nimport assert from \"node:assert/strict\";",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已避免继续纯只读，直接完成修改。",
+              tasks: [
+                {
+                  id: "plan_step_view",
+                  title: "定位 browser.test.ts",
+                  inputSummary: "确认测试文件内容和可修改锚点。",
+                  outputSummary: "已定位目标文件。",
+                  status: "done",
+                },
+                {
+                  id: "plan_step_edit",
+                  title: "补两行注释",
+                  inputSummary: "定位到文件后直接编辑。",
+                  outputSummary: "已真实修改文件。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["重复只读已被阻止，文件已修改。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "已知路径后的纯只读调用会被强制切到 modify",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["runtime 会阻止已知路径上的继续纯只读"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage: "先看 browser.test.ts 在测什么，再补两行注释说明。",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /已经定位到目标测试文件/);
+      assert.match(finalContent, /强制进入 edit/);
+      assert.equal(executorCallCount, 4);
+
+      const toolLogs = await store.toolInvocations.listBySession(session.id);
+      assert.equal(toolLogs.length, 2);
+      assert.equal(toolLogs[0]?.toolName, "view");
+      assert.equal(toolLogs[1]?.toolName, "edit");
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("不要继续对同一路径发起纯只读 toolCalls"),
         ),
         true,
       );

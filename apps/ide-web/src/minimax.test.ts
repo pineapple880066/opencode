@@ -74,6 +74,44 @@ function createRecordingMockFetch(
   };
 }
 
+function createSequencedMockFetch(
+  responses: Array<{ status: number; body: string }>,
+  onRequest?: (requestBody: Record<string, unknown>, index: number) => void,
+): typeof fetch {
+  let index = 0;
+
+  return async (_input, init) => {
+    const requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+
+    assert.equal(requestBody.model, "MiniMax-M2.7");
+    assert.equal(requestBody.reasoning_split, true);
+    onRequest?.(requestBody, index);
+
+    const next = responses[index++];
+    assert.ok(next, "mock fetch 响应数量不足");
+
+    const payload =
+      next.status >= 400
+        ? next.body
+        : JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: next.body,
+                },
+              },
+            ],
+          });
+
+    return new Response(payload, {
+      status: next.status,
+      headers: {
+        "content-type": "application/json",
+      },
+    });
+  };
+}
+
 describe("MiniMax hooks", () => {
   test("会读取 MiniMax 配置并应用默认值", () => {
     const config = readMiniMaxConfig({
@@ -326,6 +364,50 @@ describe("MiniMax hooks", () => {
     assert.deepEqual(goal?.successCriteria, ["先创建 goal", "再生成计划"]);
   });
 
+  test("provider 瞬时 500 会触发有限重试，而不是直接让整个 invoke 失败", async () => {
+    let requestCount = 0;
+
+    const hooks = createMiniMaxHooks({
+      env: {
+        MINIMAX_API_KEY: "test-key",
+      },
+      fetchImpl: createSequencedMockFetch(
+        [
+          {
+            status: 500,
+            body: JSON.stringify({
+              type: "error",
+              error: {
+                type: "server_error",
+                message: "unknown error, 520 (1000)",
+              },
+            }),
+          },
+          {
+            status: 200,
+            body: JSON.stringify({
+              title: "创建 Agent IDE Goal",
+              description: "第二次请求恢复正常。",
+              successCriteria: ["结构合法", "继续执行"],
+            }),
+          },
+        ],
+        () => {
+          requestCount += 1;
+        },
+      ),
+    });
+
+    const goal = await hooks.goalFactory?.({
+      sessionId: "session_parent",
+      userMessage: "请创建一个 goal",
+    });
+
+    assert.equal(requestCount, 2);
+    assert.equal(goal?.title, "创建 Agent IDE Goal");
+    assert.deepEqual(goal?.successCriteria, ["结构合法", "继续执行"]);
+  });
+
   test("executor 会用当前 state 补全缺失的 task 字段，并丢弃空 memory 项", async () => {
     const state: AgentGraphState = {
       workspaceId: "workspace_1",
@@ -515,5 +597,171 @@ describe("MiniMax hooks", () => {
     assert.equal(execution?.toolCalls?.[0]?.name, "view");
     assert.equal(execution?.toolCalls?.[0]?.input.path, "apps/ide-web/src/bootstrap.ts");
     assert.equal(execution?.toolCalls?.[1]?.name, "edit");
+  });
+
+  test("executor 可以返回 bash toolCall，供 headless benchmark 路径运行最小验证", async () => {
+    const state: AgentGraphState = {
+      workspaceId: "workspace_1",
+      session: {
+        id: "session_parent",
+        workspaceId: "workspace_1",
+        title: "benchmark session",
+        status: "active",
+        activeAgentMode: "build",
+        activeGoalId: "goal_parent",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: "2026-03-25T10:00:00.000Z",
+        updatedAt: "2026-03-25T10:00:00.000Z",
+      },
+      activeGoal: {
+        id: "goal_parent",
+        workspaceId: "workspace_1",
+        sessionId: "session_parent",
+        title: "修复 benchmark 失败测试",
+        description: "允许 executor 在 benchmark 场景下跑最小验证命令",
+        successCriteria: ["可请求 bash", "后续仍能落 patch"],
+        status: "active",
+        createdAt: "2026-03-25T10:00:00.000Z",
+        updatedAt: "2026-03-25T10:00:00.000Z",
+      },
+      currentPlan: {
+        id: "plan_1",
+        goalId: "goal_parent",
+        sessionId: "session_parent",
+        status: "ready",
+        summary: "先看失败输出，再跑最小验证命令。",
+        steps: [],
+        createdAt: "2026-03-25T10:00:00.000Z",
+        updatedAt: "2026-03-25T10:00:00.000Z",
+      },
+      tasks: [],
+      memory: [],
+      messages: [],
+      toolInvocations: [],
+      subagentRuns: [],
+      checkpoints: [],
+      activeAgent: "build",
+      activePolicy: DEFAULT_TOOL_POLICIES.build,
+    };
+
+    const hooks = createMiniMaxHooks({
+      env: {
+        MINIMAX_API_KEY: "test-key",
+      },
+      fetchImpl: createMockFetch([
+        JSON.stringify({
+          executionPhase: "modify",
+          toolCalls: [
+            {
+              name: "bash",
+              taskId: "task_run_tests",
+              reasoning: "先跑最小验证命令，看失败是否能复现。",
+              input: {
+                cwd: ".",
+                command: "pnpm test -- --test-name-pattern browser",
+                timeoutMs: 120000,
+              },
+            },
+          ],
+        }),
+      ]),
+    });
+
+    const execution = await hooks.executor?.(state, {
+      sessionId: "session_parent",
+      userMessage: "先解释 browser.test.ts 在测什么，再加两行注释并跑最小验证",
+    });
+
+    assert.equal(execution?.executionPhase, "modify");
+    assert.equal(execution?.toolCalls?.length, 1);
+    assert.equal(execution?.toolCalls?.[0]?.name, "bash");
+    assert.equal(execution?.toolCalls?.[0]?.input.command, "pnpm test -- --test-name-pattern browser");
+  });
+
+  test("executor 的 executionPhase 会把 validation 这类别名归一化成 verify", async () => {
+    const state: AgentGraphState = {
+      workspaceId: "workspace_1",
+      session: {
+        id: "session_verify",
+        workspaceId: "workspace_1",
+        title: "verify session",
+        status: "active",
+        activeAgentMode: "build",
+        activeGoalId: "goal_verify",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: "2026-03-26T09:00:00.000Z",
+        updatedAt: "2026-03-26T09:00:00.000Z",
+      },
+      activeGoal: {
+        id: "goal_verify",
+        workspaceId: "workspace_1",
+        sessionId: "session_verify",
+        title: "修改后做最小验证",
+        description: "修改 app.py 后，运行最小验证命令。",
+        successCriteria: ["能输出 verify phase", "bash toolCall 保留原始命令"],
+        status: "active",
+        createdAt: "2026-03-26T09:00:00.000Z",
+        updatedAt: "2026-03-26T09:00:00.000Z",
+      },
+      currentPlan: {
+        id: "plan_verify",
+        goalId: "goal_verify",
+        sessionId: "session_verify",
+        status: "ready",
+        summary: "修改后跑最小验证。",
+        steps: [],
+        createdAt: "2026-03-26T09:00:00.000Z",
+        updatedAt: "2026-03-26T09:00:00.000Z",
+      },
+      tasks: [],
+      memory: [],
+      messages: [],
+      toolInvocations: [],
+      subagentRuns: [],
+      checkpoints: [],
+      activeAgent: "build",
+      activePolicy: DEFAULT_TOOL_POLICIES.build,
+    };
+
+    const hooks = createMiniMaxHooks({
+      env: {
+        MINIMAX_API_KEY: "test-key",
+      },
+      fetchImpl: createMockFetch([
+        JSON.stringify({
+          executionPhase: "validation",
+          toolCalls: [
+            {
+              name: "bash",
+              taskId: "task_verify",
+              reasoning: "修改完成后跑最小验证。",
+              input: {
+                cmd: "python3 -m py_compile app.py",
+                working_directory: ".",
+              },
+            },
+          ],
+        }),
+      ]),
+    });
+
+    const execution = await hooks.executor?.(state, {
+      sessionId: "session_verify",
+      userMessage: "修复 app.py 后跑最小验证。",
+    });
+
+    assert.equal(execution?.executionPhase, "verify");
+    assert.equal(execution?.toolCalls?.[0]?.name, "bash");
+    assert.equal(execution?.toolCalls?.[0]?.input.cmd, "python3 -m py_compile app.py");
   });
 });

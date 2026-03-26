@@ -49,13 +49,26 @@ export interface LangGraphExecuteResult {
   toolCalls?: LangGraphToolCall[];
 }
 
-export type LangGraphExecutionPhase = "explain" | "modify" | "finalize";
+export type LangGraphExecutionPhase = "explain" | "modify" | "verify" | "finalize";
 
 export interface LangGraphToolCall {
-  name: Extract<ToolName, "list" | "view" | "grep" | "write" | "edit">;
+  name: Extract<ToolName, "list" | "view" | "grep" | "write" | "edit" | "bash">;
   input: Record<string, unknown>;
   taskId?: string;
   reasoning?: string;
+}
+
+// benchmark / headless runner 这类场景没有交互式“批准”按钮，
+// 但又确实可能需要让 agent 执行 bash（例如跑单测、查 git status）。
+// 所以这里把“是否给某个工具调用批准”抽成一个可注入决策点。
+// 默认行为仍然是：不批准任何需要 approval 的工具。
+export interface LangGraphToolApprovalDecision {
+  sessionId: string;
+  userMessage?: string;
+  toolCall: LangGraphToolCall;
+  runtimeState: AgentGraphState;
+  executionPhase: LangGraphExecutionPhase;
+  round: number;
 }
 
 // LangGraphHooks 是 provider 和 graph 之间最重要的接缝。
@@ -66,6 +79,15 @@ export interface LangGraphToolCall {
 // - 真正调用文件工具的是 RuntimeToolExecutor
 //
 // 这层抽象的价值是：换模型时尽量只改 hooks，不改 graph 主体。
+
+/**
+ * LangGraphHooks - Model Provider 和 Graph 的接缝
+ * 
+ * 每个 hook 对应一个业务节点。Hooks 只负责\"说明想做什么\"，
+ * 真实的执行委托给 GoalDrivenRuntimeService（持久化）和 RuntimeToolExecutor（工具调用）。
+ * 
+ * 换 provider 时只改这 6 个 hook，不改 graph 逻辑——这是\"provider pattern\"的核心价值。
+ */
 export interface LangGraphHooks {
   goalFactory?: (input: LangGraphInvokeInput) => Promise<LangGraphGoalDraft | null> | LangGraphGoalDraft | null;
   planner?: (
@@ -111,6 +133,9 @@ export interface LangGraphRuntimeOptions {
   hooks?: LangGraphHooks;
   checkpointer: BaseCheckpointSaver;
   toolExecutor?: RuntimeToolExecutor;
+  toolApprovalDecider?: (decision: LangGraphToolApprovalDecision) => boolean;
+  maxToolRounds?: number;
+  maxToolCallsPerRound?: number;
 }
 
 // AgentLangGraphAnnotation 就是“这张 LangGraph 图的状态 schema”。
@@ -137,18 +162,45 @@ export type AgentLangGraphState = typeof AgentLangGraphAnnotation.State;
 export type AgentLangGraphUpdate = typeof AgentLangGraphAnnotation.Update;
 type AgentLangGraphCompiled = CompiledStateGraph<AgentLangGraphState, AgentLangGraphUpdate, string>;
 
+/**
+ * 格式化单行执行日志供 Annotation 收集。
+ * - 保持为 string[]，与 Annotation.reducer 的追加语义对接。
+ * @param node - 当前 workflow 节点名
+ * @param message - 人类可读的消息内容
+ * @returns 单元素字符串数组
+ */
 function logLine(node: WorkflowNode, message: string): string[] {
   return [`${node}: ${message}`];
 }
 
+/**
+ * 类型守卫：判断值是否为普通对象（非数组、非 null）。
+ * 用于在 runtime 中对任意 JSON-like 输入做安全判断。
+ */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * 截断字符串以避免把过长内容写入日志或消息中。
+ * 保持尾部为省略号，方便人眼快速识别被裁切的情况。
+ */
 function truncate(value: string, maxLength: number): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
 }
 
+/**
+ * 稳定化序列化对象为 JSON 字符串。
+ * - 数组和对象的顺序是可预测的（对象键按字母排序）
+ * - 相同的输入总是产生相同的输出字符串
+ * - 用于在 loop guard 中计算工具调用的 checksum
+ */
+/**
+ * 对任意 JSON-like 值做稳定序列化：
+ * - 对象键按字母顺序排序，数组按顺序序列化
+ * - 相同语义输入总是产出相同字符串
+ * 主要用于计算工具调用的 checksum/去重 key
+ */
 function stableSerialize(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
@@ -164,6 +216,10 @@ function stableSerialize(value: unknown): string {
   return JSON.stringify(value);
 }
 
+/**
+ * 从一个工具调用草案生成稳定的 key，用于重复检测。
+ * 将 name/taskId/input 的语义组合并稳定化序列化。
+ */
 function buildToolCallKey(toolCall: LangGraphToolCall): string {
   return stableSerialize({
     name: toolCall.name,
@@ -180,6 +236,10 @@ function buildToolCallKey(toolCall: LangGraphToolCall): string {
 // 这样 buildToolCallKey 就变了，旧的 loop guard 也就拦不住。
 // 所以这里额外抽出“这次工具调用到底是在操作哪个路径”，
 // 后面 execute 阶段可以做更强的、按路径维度的防打转判断。
+/**
+ * 从工具调用输入中尝试解析出“路径”字段（兼容多个别名）。
+ * 返回 undefined 表示该调用不针对单一路径（例如 list/generic call）。
+ */
 function readToolCallPath(toolCall: LangGraphToolCall): string | undefined {
   if (!isRecord(toolCall.input)) {
     return undefined;
@@ -203,6 +263,17 @@ function readToolCallPath(toolCall: LangGraphToolCall): string | undefined {
 // 所以我们先识别“这次 view 是否显式声明了范围”，
 // 后面只在“已经完整读取过同一路径，且现在又来一轮新的 view”时才强拦。
 // 这样可以避免把合理的局部阅读也一刀切掉。
+
+/**
+ * 判断 view 调用是否有明确的范围限制。设计背景：
+ * - 模型可能会对同一文件做多次读取，但每次都换不同的范围
+ * - 第一次完整读，第二次精读某片段，这是合理的
+ * - 但完整读了之后还来第三次完整读，就是打转了
+ */
+/**
+ * 判断 view/grep 等读取调用是否显式包含行范围或分页信息。
+ * 该判断用于允许“合理的局部 reread”，而非把所有重复 view 一律拦截。
+ */
 function hasExplicitViewRange(toolCall: LangGraphToolCall): boolean {
   if (!isRecord(toolCall.input)) {
     return false;
@@ -215,10 +286,27 @@ function hasExplicitViewRange(toolCall: LangGraphToolCall): boolean {
     return true;
   }
 
+  if (typeof toolCall.input.offset === "number" || typeof toolCall.input.limit === "number") {
+    return true;
+  }
+  if (typeof toolCall.input.offset === "string" && toolCall.input.offset.trim().length > 0) {
+    return true;
+  }
+  if (typeof toolCall.input.limit === "string" && toolCall.input.limit.trim().length > 0) {
+    return true;
+  }
+
   const lineRange = toolCall.input.lineRange ?? toolCall.input.line_range;
   return typeof lineRange === "string" && lineRange.trim().length > 0;
 }
 
+/**
+ * 从 view 调用中抽取统一的 range key：
+ * - 优先返回 startLine-endLine
+ * - 或返回 lineRange 字符串
+ * - 或返回 offset/limit 组合
+ * 这个 key 用于判断两次 focused reread 是否针对相同片段。
+ */
 function readExplicitViewRangeKey(toolCall: LangGraphToolCall): string | undefined {
   if (!isRecord(toolCall.input)) {
     return undefined;
@@ -269,24 +357,153 @@ function readExplicitViewRangeKey(toolCall: LangGraphToolCall): string | undefin
 interface ViewReadBudgetState {
   hasFullRead: boolean;
   focusedRereads: number;
+  anchorRereads: number;
   seenFocusedRanges: Set<string>;
+  seenAnchorRanges: Set<string>;
+  knownAnchorLines: Set<number>;
 }
 
+/**
+ * 初始化单一路径的 reread 预算状态。
+ * - hasFullRead: 是否已经有一次完整读取
+ * - focusedRereads: 已使用的 focused reread 次数
+ * - seenFocusedRanges: 已见过的局部范围 key
+ */
 function createViewReadBudgetState(): ViewReadBudgetState {
   return {
     hasFullRead: false,
     focusedRereads: 0,
+    anchorRereads: 0,
     seenFocusedRanges: new Set<string>(),
+    seenAnchorRanges: new Set<string>(),
+    knownAnchorLines: new Set<number>(),
   };
 }
 
+function readNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return undefined;
+}
+
+interface ExplicitViewLineSpan {
+  startLine: number;
+  endLine: number;
+}
+
+function readExplicitViewLineSpan(toolCall: LangGraphToolCall): ExplicitViewLineSpan | undefined {
+  if (!isRecord(toolCall.input)) {
+    return undefined;
+  }
+
+  const directStart = readNumber(toolCall.input.startLine ?? toolCall.input.start_line);
+  const directEnd = readNumber(toolCall.input.endLine ?? toolCall.input.end_line);
+
+  if (directStart !== undefined || directEnd !== undefined) {
+    const startLine = Math.max(1, directStart ?? directEnd ?? 1);
+    const endLine = Math.max(startLine, directEnd ?? startLine);
+    return { startLine, endLine };
+  }
+
+  const lineRange = toolCall.input.lineRange ?? toolCall.input.line_range;
+  if (typeof lineRange === "string" && lineRange.trim().length > 0) {
+    const matched = lineRange.trim().match(/^(\d+)\s*-\s*(\d+)$/);
+    if (matched) {
+      const startLine = Math.max(1, Number(matched[1]));
+      const endLine = Math.max(startLine, Number(matched[2]));
+      return { startLine, endLine };
+    }
+  }
+
+  const offset = readNumber(toolCall.input.offset);
+  const limit = readNumber(toolCall.input.limit);
+  if (offset !== undefined || limit !== undefined) {
+    const startLine = Math.max(1, (offset ?? 0) + 1);
+    const endLine = Math.max(startLine, startLine + Math.max(0, (limit ?? 1) - 1));
+    return { startLine, endLine };
+  }
+
+  return undefined;
+}
+
+function isAnchorFocusedReread(
+  viewBudget: ViewReadBudgetState,
+  toolCall: LangGraphToolCall,
+): boolean {
+  const span = readExplicitViewLineSpan(toolCall);
+  if (!span) {
+    return false;
+  }
+
+  for (const line of viewBudget.knownAnchorLines) {
+    if (line >= span.startLine && line <= span.endLine) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function recordAnchorLinesFromGrepOutput(
+  viewReadBudgets: Map<string, ViewReadBudgetState>,
+  output: unknown,
+): void {
+  if (!isRecord(output) || !Array.isArray(output.matches)) {
+    return;
+  }
+
+  for (const match of output.matches) {
+    if (!isRecord(match)) {
+      continue;
+    }
+
+    const matchPath = typeof match.path === "string" && match.path.trim().length > 0 ? match.path.trim() : undefined;
+    const line = readNumber(match.line);
+    if (!matchPath || line === undefined) {
+      continue;
+    }
+
+    const budget = viewReadBudgets.get(matchPath) ?? createViewReadBudgetState();
+    budget.knownAnchorLines.add(line);
+    viewReadBudgets.set(matchPath, budget);
+  }
+}
+
+/**
+ * 根据 executor 返回内容推断当前执行阶段：
+ * - modify: 包含 edit/write
+ * - explain: 包含 view/grep/list
+ * - finalize: 否则
+ * Hooks 也可以通过 execution.executionPhase 显式指定阶段。
+ */
 function inferExecutionPhase(execution: LangGraphExecuteResult): LangGraphExecutionPhase {
   if (execution.executionPhase) {
     return execution.executionPhase;
   }
 
-  const toolNames = new Set((execution.toolCalls ?? []).map((toolCall) => toolCall.name));
+  const toolCalls = execution.toolCalls ?? [];
+  const toolNames = new Set(toolCalls.map((toolCall) => toolCall.name));
   if (toolNames.has("edit") || toolNames.has("write")) {
+    return "modify";
+  }
+  if (
+    toolCalls.some(
+      (toolCall) =>
+        toolCall.name === "bash" && commandLooksLikeVerification(readBashCommand(toolCall.input)),
+    )
+  ) {
+    return "verify";
+  }
+  if (toolNames.has("bash")) {
     return "modify";
   }
   if (toolNames.has("view") || toolNames.has("grep") || toolNames.has("list")) {
@@ -296,6 +513,9 @@ function inferExecutionPhase(execution: LangGraphExecuteResult): LangGraphExecut
   return "finalize";
 }
 
+/**
+ * 生成系统级的 loop-guard 提示，说明某次 view 请求被拦截的原因和下一步建议。
+ */
 function createViewBudgetGuardMessage(
   toolCall: LangGraphToolCall,
   path: string,
@@ -311,21 +531,119 @@ function createViewBudgetGuardMessage(
   ].join("\n");
 }
 
+function createVerificationPolicyMessage(message: string): string {
+  return [
+    "VERIFICATION_POLICY: 当前 invoke 已经进入真实修改阶段。",
+    message,
+  ].join("\n");
+}
+
+/**
+ * 基于用户消息的关键词简单启发式判断，是否存在“想让 agent 修改代码/文件”的意图。
+ */
 function looksLikeModificationRequest(userMessage: string | undefined): boolean {
   if (!userMessage) {
     return false;
   }
 
-  return /(修改|编辑|改动|加注释|注释|写入|替换|重构|补上|comment|edit|write|patch|modify|change|update)/i.test(
-    userMessage,
+  return textSuggestsModification(userMessage);
+}
+
+// 这层启发式不是在“理解代码语义”，而是在尽量稳定地区分：
+// - 只是解释/查看
+// - 明确需要真实修改文件
+//
+// 之前这里过度依赖 modify/edit 这样的直白词汇，
+// 结果像 “Add a text parameter” / “Raise error when ...” 这类真实 benchmark 需求
+// 会被误判成“没有待修改工作”，从而提前收尾。
+function textSuggestsModification(value: string): boolean {
+  return (
+    /(修改|编辑|改动|加注释|注释|写入|替换|重构|补上|添加|加入|支持|实现|修复|调整|新增|报错|校验|参数)/i.test(
+      value,
+    )
+    || /\b(comment|edit|write|patch|modify|change|update|add|implement|support|fix|rename|refactor|validate|parameter|error)\b/i.test(
+      value,
+    )
   );
 }
 
+function textSuggestsDocumentationOnly(value: string): boolean {
+  return /(注释|文档|说明|readme|comment|comments|documentation|docstring)/i.test(value);
+}
+
+function textSuggestsBehavioralChange(value: string): boolean {
+  return (
+    /(修复|报错|错误|异常|校验|逻辑|默认值|参数|功能|行为|兼容|超时|请求|响应|配置|验证|回归|实现|支持|新增|重构|失败测试)/i.test(
+      value,
+    )
+    || /\b(fix|bug|error|exception|validate|validation|logic|default|parameter|feature|behavior|regression|support|implement|timeout|request|response|config|compatibility|failing test|test failure)\b/i.test(
+      value,
+    )
+  );
+}
+
+function textSuggestsNoBehaviorChange(value: string): boolean {
+  return (
+    /(不影响|不涉及|不会改动|不修改|只做|仅做|纯).{0,8}(行为|逻辑|功能|默认值|参数|校验|验证)/i.test(value)
+    || /(只加注释|仅加注释|纯注释|documentation-only|comment-only)/i.test(value)
+  );
+}
+
+function collectVerificationIntentText(state: AgentGraphState, userMessage: string | undefined): string {
+  return [
+    userMessage ?? "",
+    state.activeGoal.title,
+    state.activeGoal.description,
+    ...state.activeGoal.successCriteria,
+    state.currentPlan?.summary ?? "",
+    ...(state.currentPlan?.steps.map((step) => `${step.title} ${step.description} ${step.evidence ?? ""}`) ?? []),
+    ...state.tasks.map((task) => `${task.title} ${task.inputSummary} ${task.outputSummary ?? ""}`),
+  ]
+    .filter((chunk) => chunk.trim().length > 0)
+    .join("\n");
+}
+
+function shouldRequirePostWriteVerification(
+  state: AgentGraphState,
+  userMessage: string | undefined,
+): boolean {
+  const userIntent = userMessage ?? "";
+  if (textSuggestsDocumentationOnly(userIntent) && !textSuggestsBehavioralChange(userIntent)) {
+    return false;
+  }
+
+  const corpus = collectVerificationIntentText(state, userMessage);
+  if (corpus.trim().length === 0) {
+    return false;
+  }
+
+  if (
+    textSuggestsDocumentationOnly(corpus)
+    && !textSuggestsBehavioralChange(corpus)
+  ) {
+    return false;
+  }
+
+  if (
+    textSuggestsDocumentationOnly(corpus)
+    && textSuggestsNoBehaviorChange(corpus)
+    && !textSuggestsBehavioralChange(userIntent)
+  ) {
+    return false;
+  }
+
+  return textSuggestsBehavioralChange(corpus);
+}
+
+/**
+ * 判断 runtimeState 中是否存在明显的、尚未完成的修改类任务或计划步骤。
+ * 该函数用于在 explain -> modify 的过渡策略中决定是否要强制进入 modify。
+ */
 function hasPendingModificationWork(state: AgentGraphState): boolean {
   const taskSuggestsModify = state.tasks.some(
     (task) =>
       (task.status === "todo" || task.status === "in_progress" || task.status === "blocked")
-      && /(修改|编辑|加注释|写|替换|补|edit|write|comment|modify|update)/i.test(
+      && textSuggestsModification(
         `${task.title} ${task.inputSummary} ${task.outputSummary ?? ""}`,
       ),
   );
@@ -338,13 +656,122 @@ function hasPendingModificationWork(state: AgentGraphState): boolean {
     state.currentPlan?.steps.some(
       (step) =>
         (step.status === "todo" || step.status === "in_progress" || step.status === "blocked")
-        && /(修改|编辑|加注释|写|替换|补|edit|write|comment|modify|update)/i.test(
+        && textSuggestsModification(
           `${step.title} ${step.description} ${step.evidence ?? ""}`,
         ),
     ),
   );
 }
 
+function parseToolLogInput(inputJson: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(inputJson) as unknown;
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readPathFromUnknownInput(input: unknown): string | undefined {
+  if (!isRecord(input)) {
+    return undefined;
+  }
+
+  const pathValue = input.path ?? input.file_path ?? input.filePath;
+  return typeof pathValue === "string" && pathValue.trim().length > 0 ? pathValue.trim() : undefined;
+}
+
+function collectPreviouslyViewedPaths(state: AgentGraphState): Set<string> {
+  const viewedPaths = new Set<string>();
+
+  for (const log of state.toolInvocations) {
+    if (log.status !== "completed" || log.toolName !== "view") {
+      continue;
+    }
+
+    const parsedInput = parseToolLogInput(log.inputJson);
+    const path = readPathFromUnknownInput(parsedInput);
+    if (path) {
+      viewedPaths.add(path);
+    }
+  }
+
+  return viewedPaths;
+}
+
+function hasLocatedModificationAnchor(state: AgentGraphState): boolean {
+  return collectPreviouslyViewedPaths(state).size > 0;
+}
+
+function isReadOnlyToolCall(toolCall: LangGraphToolCall): boolean {
+  return toolCall.name === "view" || toolCall.name === "grep" || toolCall.name === "list";
+}
+
+function readOnlyToolCallsTargetKnownPath(
+  state: AgentGraphState,
+  toolCalls: LangGraphToolCall[],
+): boolean {
+  const viewedPaths = collectPreviouslyViewedPaths(state);
+  if (viewedPaths.size === 0) {
+    return false;
+  }
+
+  let sawKnownReadOnlyPath = false;
+
+  for (const toolCall of toolCalls) {
+    if (!isReadOnlyToolCall(toolCall)) {
+      return false;
+    }
+
+    const path = readPathFromUnknownInput(toolCall.input);
+    if (!path) {
+      continue;
+    }
+
+    if (viewedPaths.has(path)) {
+      sawKnownReadOnlyPath = true;
+      continue;
+    }
+
+    return false;
+  }
+
+  return sawKnownReadOnlyPath;
+}
+
+function readBashCommand(input: unknown): string | undefined {
+  if (!isRecord(input)) {
+    return undefined;
+  }
+
+  const command = input.command ?? input.cmd ?? input.script;
+  return typeof command === "string" && command.trim().length > 0 ? command.trim() : undefined;
+}
+
+function commandLooksLikeVerification(command: string | undefined): boolean {
+  if (!command) {
+    return false;
+  }
+
+  return /\b(pytest|unittest|vitest|jest|mocha|ava|tox|nox|phpunit|rspec)\b/i.test(command)
+    || /\b(go test|go vet|cargo test|cargo check|mvn test|gradle test|make test)\b/i.test(command)
+    || /\b(pnpm test|pnpm typecheck|pnpm lint|npm test|npm run test|npm run lint|yarn test)\b/i.test(command)
+    || /\b(tsc\b|eslint\b|ruff check|mypy\b|py_compile|git diff --check|verify|verification|typecheck|lint|build|compile|check)\b/i.test(command);
+}
+
+function readBashExitCode(output: unknown): number | undefined {
+  if (!isRecord(output)) {
+    return undefined;
+  }
+
+  return typeof output.exitCode === "number" && Number.isFinite(output.exitCode) ? output.exitCode : undefined;
+}
+
+/**
+ * 构造传给 RuntimeToolExecutor 的最终输入：
+ * - 复制原始 toolCall.input
+ * - 注入 workspace 根路径（root）以便工具定位文件
+ */
 function prepareToolInput(
   workspacePath: string,
   toolCall: LangGraphToolCall,
@@ -357,6 +784,11 @@ function prepareToolInput(
   };
 }
 
+/**
+ * 把工具调用结果格式化成可写入 message ledger 的字符串：
+ * - 对 view 专门提取 path / lineRange / content（做截断）
+ * - 对其它工具安全序列化 output
+ */
 function summarizeToolResult(
   toolCall: LangGraphToolCall,
   result: ToolResult<unknown>,
@@ -397,6 +829,10 @@ function summarizeToolResult(
   return lines.join("\n");
 }
 
+/**
+ * 当检测到完全重复的工具调用刚刚已经成功执行时，生成的系统提示。
+ * 该提示旨在提醒模型不要原样重复同一操作。
+ */
 function createDuplicateToolLoopGuardMessage(toolCall: LangGraphToolCall): string {
   const guidance =
     toolCall.name === "view"
@@ -411,6 +847,10 @@ function createDuplicateToolLoopGuardMessage(toolCall: LangGraphToolCall): strin
   ].join("\n");
 }
 
+/**
+ * 从 runtimeState 提取一个精简的 JSON 字符串，用作 checkpoint 的 stateJson 字段。
+ * 目的是保存必要的元信息以便快速恢复会话上下文，而不是把整个实体 dump 出去。
+ */
 function summarizeStateForCheckpoint(runtimeState: AgentGraphState | null): string {
   return JSON.stringify({
     workspaceId: runtimeState?.workspaceId ?? null,
@@ -424,6 +864,10 @@ function summarizeStateForCheckpoint(runtimeState: AgentGraphState | null): stri
   });
 }
 
+/**
+ * 将当前工作流节点的轻量快照写入持久化 checkpointer（通过 service 封装）。
+ * 仅保存 summarizeStateForCheckpoint 返回的精简状态，避免过度冗余。
+ */
 async function persistWorkflowCheckpoint(
   service: GoalDrivenRuntimeService,
   sessionId: string,
@@ -439,6 +883,10 @@ async function persistWorkflowCheckpoint(
   });
 }
 
+/**
+ * 从服务层重新读取当前 session 的 runtime state（实时一致读取）。
+ * 这个封装便于后续在全局范围内统一替换为带缓存/观察器的实现。
+ */
 async function refreshRuntimeState(
   service: GoalDrivenRuntimeService,
   sessionId: string,
@@ -446,6 +894,10 @@ async function refreshRuntimeState(
   return service.buildGraphState(sessionId);
 }
 
+/**
+ * 在没有注入 summarizer hook 时，生成一个覆盖常见字段的默认 session summary。
+ * 该函数只负责把 runtimeState 压缩为 UI/IDE 需要的一小段概要文本。
+ */
 function createDefaultSummary(state: AgentGraphState): Omit<UpdateSessionSummaryInput, "sessionId"> {
   return {
     shortSummary: `当前 goal：${state.activeGoal.title}`,
@@ -462,6 +914,17 @@ function createDefaultSummary(state: AgentGraphState): Omit<UpdateSessionSummary
 // 面试点：LangGraph 在这里负责“编排顺序”和 thread_id 恢复，
 // 但真正的业务动作仍然走 GoalDrivenRuntimeService。
 // 这样我们既拿到了 graph orchestration，又没有把业务逻辑绑死在框架 API 上。
+
+/**
+ * 创建 Goal-Driven Runtime 的 LangGraph 实例。
+ * 这是整个 runtime 的编排中心，定义 8 个节点并串联成执行流程。
+ * 
+ * 设计关键：
+ * - 节点实现与 LangGraphHooks 解耦（hook 返回草案，service 执行业务动作）
+ * - 工具调用与 graph 分离（executor 只给清单，真正执行在 toolExecutor）
+ * - 完整的 loop guard 防止打转
+ * - 每节点保存 checkpoint，支持会话恢复
+ */
 export function createAgentLangGraph(
   service: GoalDrivenRuntimeService,
   options: LangGraphRuntimeOptions,
@@ -469,14 +932,15 @@ export function createAgentLangGraph(
   const hooks = options.hooks ?? {};
   const checkpointer = options.checkpointer;
   const toolExecutor = options.toolExecutor;
+  const toolApprovalDecider = options.toolApprovalDecider;
+  const maxToolRounds = options.maxToolRounds ?? 5;
+  const maxToolCallsPerRound = options.maxToolCallsPerRound ?? 4;
 
   const intakeNode = async (state: AgentLangGraphState): Promise<AgentLangGraphUpdate> => {
-    // intake 是 graph 的入口。
-    // 它负责把外部输入先稳定落到系统里：
-    // - 用户消息先入 message ledger
-    // - 如果当前 session 还没有 active goal，再尝试调用 goalFactory 生成第一个 goal
-    //
-    // 所以后面 plan/execute 能否运行，前提通常都在这里建立。
+    // intake 是 graph 的入口。职责：
+    // 1. 记录用户消息到 ledger
+    // 2. 如果没有 active goal，调 goalFactory 生成第一个目标
+    // 之后的 plan/execute 阶段才能真正开始
     if (state.userMessage) {
       await service.appendMessage({
         sessionId: state.sessionId,
@@ -635,8 +1099,10 @@ export function createAgentLangGraph(
     let executedWriteLikeTool = false;
     let lastSuccessfulToolCallKey: string | undefined;
     const viewReadBudgets = new Map<string, ViewReadBudgetState>();
-    const maxToolRounds = 5;
-    const maxToolCallsPerRound = 4;
+    let writeGeneration = 0;
+    let verificationAttemptGeneration = 0;
+    let verificationSuccessGeneration = 0;
+    let verificationFailureGeneration = 0;
 
     for (let round = 0; round < maxToolRounds; round += 1) {
       const execution = await hooks.executor(runtimeState, {
@@ -654,13 +1120,47 @@ export function createAgentLangGraph(
 
       const toolCalls = (execution.toolCalls ?? []).slice(0, maxToolCallsPerRound);
       const executionPhase = inferExecutionPhase(execution);
-      const shouldForceModifyContinuation =
-        toolCalls.length === 0
-        && executionPhase === "explain"
+      const hasModificationAnchor = hasLocatedModificationAnchor(runtimeState);
+      const requiresVerification = shouldRequirePostWriteVerification(runtimeState, state.userMessage);
+      const hasVerificationAttemptSinceLatestWrite =
+        writeGeneration > 0 && verificationAttemptGeneration >= writeGeneration;
+      const hasSuccessfulVerificationSinceLatestWrite =
+        writeGeneration > 0 && verificationSuccessGeneration >= writeGeneration;
+      const hasFailedVerificationSinceLatestWrite =
+        writeGeneration > 0
+        && verificationFailureGeneration >= writeGeneration
+        && verificationSuccessGeneration < writeGeneration;
+      const shouldForceModifyAfterKnownRead =
+        toolCalls.length > 0
+        && executionPhase !== "finalize"
+        && executionPhase !== "verify"
         && executedToolCalls > 0
         && !executedWriteLikeTool
         && looksLikeModificationRequest(state.userMessage)
         && hasPendingModificationWork(runtimeState)
+        && hasModificationAnchor
+        && readOnlyToolCallsTargetKnownPath(runtimeState, toolCalls)
+        && !toolCalls.every((toolCall) => buildToolCallKey(toolCall) === lastSuccessfulToolCallKey)
+        && !toolCalls.some((toolCall) => toolCall.name === "view" && hasExplicitViewRange(toolCall))
+        && round < maxToolRounds - 1;
+      const shouldForceModifyContinuation =
+        toolCalls.length === 0
+        && executedToolCalls > 0
+        && !executedWriteLikeTool
+        && looksLikeModificationRequest(state.userMessage)
+        && hasPendingModificationWork(runtimeState)
+        && hasModificationAnchor
+        && round < maxToolRounds - 1;
+      const shouldForceVerificationBeforeFinalize =
+        requiresVerification
+        && writeGeneration > 0
+        && !hasVerificationAttemptSinceLatestWrite
+        && (toolCalls.length === 0 || executionPhase === "finalize")
+        && round < maxToolRounds - 1;
+      const shouldForceRetryAfterFailedVerification =
+        requiresVerification
+        && hasFailedVerificationSinceLatestWrite
+        && (toolCalls.length === 0 || executionPhase === "finalize")
         && round < maxToolRounds - 1;
 
       // mixed explain + edit 请求里，如果模型先完成了解释、但还没真正落修改，
@@ -682,15 +1182,41 @@ export function createAgentLangGraph(
         });
       }
 
-      if (shouldForceModifyContinuation) {
+      if (shouldForceModifyContinuation || shouldForceModifyAfterKnownRead) {
         await service.appendMessage({
           sessionId: state.sessionId,
           role: "system",
           content: [
             "EXECUTION_POLICY: 用户请求同时包含解释和修改。",
-            "当前 explain phase 已经产出了说明，但文件还没有真实改动。",
-            "下一轮必须切到 modify phase，直接发起 edit/write，不能在 explain phase 收尾。",
+            "当前已经定位到可修改文件或改动锚点，但文件还没有真实改动。",
+            shouldForceModifyAfterKnownRead
+              ? "不要继续对同一路径发起纯只读 toolCalls；下一轮必须切到 modify phase，直接发起 edit/write。"
+              : "下一轮必须切到 modify phase，直接发起 edit/write，不能在 explain/finalize 阶段收尾。",
           ].join("\n"),
+        });
+        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+        continue;
+      }
+
+      if (shouldForceVerificationBeforeFinalize) {
+        await service.appendMessage({
+          sessionId: state.sessionId,
+          role: "system",
+          content: createVerificationPolicyMessage(
+            "当前 invoke 已经真实修改过文件，但在最新改动之后还没有任何验证尝试。下一轮必须切到 verify phase，并优先通过 bash 运行最小相关验证（测试、typecheck、lint、build 或 git diff --check），不要直接 finalize。",
+          ),
+        });
+        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+        continue;
+      }
+
+      if (shouldForceRetryAfterFailedVerification) {
+        await service.appendMessage({
+          sessionId: state.sessionId,
+          role: "system",
+          content: createVerificationPolicyMessage(
+            "最近一次 verify phase 在最新改动之后失败了。下一轮不要 finalize；你必须基于失败输出继续 modify，或者再次请求更小范围的 verify。",
+          ),
         });
         runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
         continue;
@@ -732,6 +1258,8 @@ export function createAgentLangGraph(
           toolCall.name === "view" && toolPath
             ? (viewReadBudgets.get(toolPath) ?? createViewReadBudgetState())
             : undefined;
+        const anchorFocusedReread =
+          toolCall.name === "view" && viewBudget ? isAnchorFocusedReread(viewBudget, toolCall) : false;
 
         // 第一层 loop guard：完全相同的工具调用刚刚已经成功执行过。
         // 这个规则能拦住最直接的“同一个 tool + 同一个 input 原样重放”。
@@ -753,10 +1281,11 @@ export function createAgentLangGraph(
         //
         // 现在的策略改成：
         // - 第一次完整读取允许
-        // - 完整读取之后，允许 1 次 focused reread
-        // - focused reread 必须带新的范围，并且当前 phase 仍是 explain
+        // - 完整读取之后，允许 1 次普通 focused reread
+        // - 如果 grep 之后发现了新的锚点行号，再额外允许 1 次 anchor reread
+        // - reread 必须带新的范围，并且当前 phase 仍是 explain
         // - 进入 modify/finalize 后，不再允许回头 reread
-        // - 第 3 次读取同一路径时再拦截
+        // - 普通 reread 和 anchor reread 的预算都用尽后，再继续读取才拦截
         //
         // 这层更像“tool-use control loop”而不是简单去重。
         if (toolCall.name === "view" && toolPath && viewBudget) {
@@ -766,6 +1295,14 @@ export function createAgentLangGraph(
             if (!explicitViewRangeKey) {
               budgetViolationReason =
                 "当前文件已经完整读取过一次。full reread 不再允许；如果证据已经足够，请直接 edit/write 或总结。";
+            } else if (anchorFocusedReread) {
+              if (viewBudget.seenAnchorRanges.has(explicitViewRangeKey)) {
+                budgetViolationReason =
+                  "当前 anchor reread 没有带来新的锚点范围信息；重复精读同一锚点片段不会增加信息增益。";
+              } else if (viewBudget.anchorRereads >= 1) {
+                budgetViolationReason =
+                  "当前文件已经用掉 1 次 anchor reread 预算。请基于已有锚点上下文直接 edit/write。";
+              }
             } else if (viewBudget.focusedRereads >= 1) {
               budgetViolationReason =
                 "当前文件已经用掉 1 次 focused reread 预算。第 3 次再读同一路径会被拦截。";
@@ -794,6 +1331,15 @@ export function createAgentLangGraph(
           name: toolCall.name,
           input: prepareToolInput(workspace.path, toolCall),
           taskId: toolCall.taskId,
+          approvalGranted:
+            toolApprovalDecider?.({
+              sessionId: state.sessionId,
+              userMessage: state.userMessage,
+              toolCall,
+              runtimeState,
+              executionPhase,
+              round: round + 1,
+            }) ?? false,
         });
         executedToolCalls += 1;
         executedThisRound += 1;
@@ -801,13 +1347,33 @@ export function createAgentLangGraph(
           lastSuccessfulToolCallKey = toolCallKey;
           if (toolCall.name === "edit" || toolCall.name === "write") {
             executedWriteLikeTool = true;
+            writeGeneration += 1;
+          }
+
+          if (toolCall.name === "grep") {
+            recordAnchorLinesFromGrepOutput(viewReadBudgets, result.output);
+          }
+
+          if (toolCall.name === "bash" && commandLooksLikeVerification(readBashCommand(toolCall.input))) {
+            verificationAttemptGeneration = Math.max(verificationAttemptGeneration, writeGeneration);
+            const exitCode = readBashExitCode(result.output);
+            if ((exitCode ?? 1) === 0) {
+              verificationSuccessGeneration = Math.max(verificationSuccessGeneration, writeGeneration);
+            } else {
+              verificationFailureGeneration = Math.max(verificationFailureGeneration, writeGeneration);
+            }
           }
 
           if (toolCall.name === "view" && toolPath && viewBudget) {
             if (hasExplicitViewRange(toolCall) && explicitViewRangeKey) {
-              viewBudget.seenFocusedRanges.add(explicitViewRangeKey);
               if (viewBudget.hasFullRead) {
-                viewBudget.focusedRereads += 1;
+                if (anchorFocusedReread) {
+                  viewBudget.seenAnchorRanges.add(explicitViewRangeKey);
+                  viewBudget.anchorRereads += 1;
+                } else {
+                  viewBudget.seenFocusedRanges.add(explicitViewRangeKey);
+                  viewBudget.focusedRereads += 1;
+                }
               }
             } else {
               viewBudget.hasFullRead = true;
@@ -832,12 +1398,10 @@ export function createAgentLangGraph(
 
     const summary =
       executedToolCalls > 0
-        ? `已执行 ${executedToolCalls} 次工具调用，并把 executor 结果吸收到 runtime store${
-            duplicateToolCalls > 0 ? `；拦截了 ${duplicateToolCalls} 次重复工具调用` : ""
-          }`
-        : `已把 executor 结果吸收到 runtime store${
-            duplicateToolCalls > 0 ? `；拦截了 ${duplicateToolCalls} 次重复工具调用` : ""
-          }`;
+        ? `已执行 ${executedToolCalls} 次工具调用，并把 executor 结果吸收到 runtime store${duplicateToolCalls > 0 ? `；拦截了 ${duplicateToolCalls} 次重复工具调用` : ""
+        }`
+        : `已把 executor 结果吸收到 runtime store${duplicateToolCalls > 0 ? `；拦截了 ${duplicateToolCalls} 次重复工具调用` : ""
+        }`;
     await persistWorkflowCheckpoint(service, state.sessionId, "execute", runtimeState, summary);
 
     return {
@@ -907,9 +1471,9 @@ export function createAgentLangGraph(
     const summaryInput =
       (hooks.summarizer
         ? await hooks.summarizer(state.runtimeState, {
-            sessionId: state.sessionId,
-            userMessage: state.userMessage,
-          })
+          sessionId: state.sessionId,
+          userMessage: state.userMessage,
+        })
         : null) ?? createDefaultSummary(state.runtimeState);
 
     await service.updateSessionSummary({
@@ -977,7 +1541,7 @@ export function createAgentLangGraph(
 //
 // 这样上层依赖的是“项目自己的 runtime API”，而不是直接贴着框架细节写。
 export class AgentLangGraphRuntime {
-  constructor(private readonly graph: AgentLangGraphCompiled) {}
+  constructor(private readonly graph: AgentLangGraphCompiled) { }
 
   async invoke(input: LangGraphInvokeInput): Promise<AgentLangGraphState> {
     // 这里最关键的设计是：

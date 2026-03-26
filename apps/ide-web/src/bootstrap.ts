@@ -21,6 +21,7 @@ import {
   RuntimeToolExecutor,
   type AgentLangGraphRuntime,
   type LangGraphHooks,
+  type LangGraphRuntimeOptions,
   type RuntimeServiceOptions,
   type RuntimeStore,
 } from "@agent-ide/runtime";
@@ -39,6 +40,9 @@ export interface IdeRuntimeBootstrapOptions {
   persistence?: MySqlBootstrapOptions;
   hooks?: LangGraphHooks;
   registry?: ToolRegistry;
+  toolApprovalDecider?: LangGraphRuntimeOptions["toolApprovalDecider"];
+  maxToolRounds?: LangGraphRuntimeOptions["maxToolRounds"];
+  maxToolCallsPerRound?: LangGraphRuntimeOptions["maxToolCallsPerRound"];
   runtimeServiceOptions?: Partial<RuntimeServiceOptions>;
 }
 
@@ -180,6 +184,9 @@ export async function createIdeRuntimeEnvironment(
       hooks: options?.hooks,
       checkpointer,
       toolExecutor,
+      toolApprovalDecider: options?.toolApprovalDecider,
+      maxToolRounds: options?.maxToolRounds,
+      maxToolCallsPerRound: options?.maxToolCallsPerRound,
     });
 
     // ========================================================================

@@ -248,6 +248,25 @@ function normalizeWriteInput(input: WriteInput): WriteInput {
   };
 }
 
+// 这次 Flask benchmark 暴露出 grep 合同还有两处阻抗：
+// 1. 模型更常输出 pattern，而不是 query
+// 2. 模型会直接把单文件路径传给 grep，希望只在这个文件里查
+//
+// 如果工具层不先收敛这些差异，runtime 再强的 control loop 也只是在围着错误协议打转。
+function normalizeGrepInput(input: GrepInput): GrepInput {
+  return {
+    ...input,
+    path: normalizeWorkspacePathInput(input),
+    query: pickStringAlias(input, ["query", "pattern", "keyword"]) ?? input.query,
+    caseSensitive:
+      pickBooleanAlias(input, ["caseSensitive", "case_sensitive"]) ?? input.caseSensitive,
+    maxResults:
+      pickNumberAlias(input, ["maxResults", "max_results"]) ?? input.maxResults,
+    includeHidden:
+      pickBooleanAlias(input, ["includeHidden", "include_hidden"]) ?? input.includeHidden,
+  };
+}
+
 function normalizeEditInput(input: EditInput): EditInput {
   const expectedReplacements = pickNumberAlias(input, ["expected_replacements", "expectedReplacements"]);
 
@@ -255,12 +274,29 @@ function normalizeEditInput(input: EditInput): EditInput {
     ...input,
     path: normalizeWorkspacePathInput(input),
     search:
-      pickStringAlias(input, ["search", "old_string", "oldString"]) ?? input.search,
+      pickStringAlias(input, ["search", "old_string", "oldString", "old_text", "oldText"]) ?? input.search,
     replace:
-      pickStringAlias(input, ["replace", "new_string", "newString"]) ?? input.replace,
+      pickStringAlias(input, ["replace", "new_string", "newString", "new_text", "newText"]) ?? input.replace,
     replaceAll:
       pickBooleanAlias(input, ["replaceAll", "replace_all"]) ??
       (expectedReplacements !== undefined ? expectedReplacements > 1 : input.replaceAll),
+  };
+}
+
+// benchmark / headless runner 这类场景里，模型经常会把 bash 参数写成：
+// - cmd
+// - script
+// - working_directory / workingDirectory
+// - timeout_ms
+//
+// 如果这些最常见的别名不先在工具层收敛，验证阶段本身就会因为协议阻抗失败，
+// 然后 runtime 会误以为“模型不会验证”，其实只是 bash 合同没对齐。
+function normalizeBashInput(input: BashInput): BashInput {
+  return {
+    ...input,
+    cwd: pickStringAlias(input, ["cwd", "working_directory", "workingDirectory", "dir"]) ?? input.cwd,
+    command: pickStringAlias(input, ["command", "cmd", "script"]) ?? input.command,
+    timeoutMs: pickNumberAlias(input, ["timeoutMs", "timeout_ms", "timeout"]) ?? input.timeoutMs,
   };
 }
 
@@ -390,12 +426,18 @@ async function walkFilesForGrep(
 }
 
 async function grepTool(input: GrepInput): Promise<GrepOutput> {
-  const root = path.resolve(input.root);
-  const basePath = resolveWithinRoot(root, normalizeWorkspacePathInput(input));
-  const maxResults = input.maxResults ?? 100;
-  const includeHidden = input.includeHidden ?? false;
-  const caseSensitive = input.caseSensitive ?? false;
+  const normalizedInput = normalizeGrepInput(input);
+  const root = path.resolve(normalizedInput.root);
+  const basePath = resolveWithinRoot(root, normalizedInput.path);
+  const baseStat = await stat(basePath);
+  const maxResults = normalizedInput.maxResults ?? 100;
+  const includeHidden = normalizedInput.includeHidden ?? false;
+  const caseSensitive = normalizedInput.caseSensitive ?? false;
   const matches: GrepMatch[] = [];
+
+  if (typeof normalizedInput.query !== "string" || normalizedInput.query.trim().length === 0) {
+    throw new Error("grep.query 不能为空；兼容字段可使用 query 或 pattern");
+  }
 
   try {
     const args = [
@@ -405,7 +447,7 @@ async function grepTool(input: GrepInput): Promise<GrepOutput> {
       "never",
       "--max-count",
       String(maxResults),
-      input.query,
+      normalizedInput.query,
       basePath,
     ];
     if (!caseSensitive) {
@@ -433,15 +475,19 @@ async function grepTool(input: GrepInput): Promise<GrepOutput> {
     }
 
     return {
-      query: input.query,
+      query: normalizedInput.query,
       matches,
       truncated: matches.length >= maxResults,
     };
   } catch {
     const files: string[] = [];
-    await walkFilesForGrep(root, basePath, includeHidden, files);
+    if (baseStat.isDirectory()) {
+      await walkFilesForGrep(root, basePath, includeHidden, files);
+    } else {
+      files.push(basePath);
+    }
 
-    const normalizedQuery = caseSensitive ? input.query : input.query.toLowerCase();
+    const normalizedQuery = caseSensitive ? normalizedInput.query : normalizedInput.query.toLowerCase();
     for (const filePath of files) {
       if (matches.length >= maxResults) {
         break;
@@ -473,7 +519,7 @@ async function grepTool(input: GrepInput): Promise<GrepOutput> {
     }
 
     return {
-      query: input.query,
+      query: normalizedInput.query,
       matches,
       truncated: matches.length >= maxResults,
     };
@@ -507,11 +553,11 @@ async function editTool(input: EditInput): Promise<EditOutput> {
   const before = await readFile(targetPath, "utf8");
 
   if (typeof normalizedInput.search !== "string" || normalizedInput.search.length === 0) {
-    throw new Error("edit.search 不能为空；兼容字段可使用 search、old_string 或 oldString");
+    throw new Error("edit.search 不能为空；兼容字段可使用 search、old_string、oldString、old_text 或 oldText");
   }
 
   if (typeof normalizedInput.replace !== "string") {
-    throw new Error("edit.replace 不能为空；兼容字段可使用 replace、new_string 或 newString");
+    throw new Error("edit.replace 不能为空；兼容字段可使用 replace、new_string、newString、new_text 或 newText");
   }
 
   const occurrences = before.split(normalizedInput.search).length - 1;
@@ -532,13 +578,18 @@ async function editTool(input: EditInput): Promise<EditOutput> {
 }
 
 async function bashTool(input: BashInput): Promise<BashOutput> {
-  const root = path.resolve(input.root);
-  const cwd = resolveWithinRoot(root, input.cwd);
+  const normalizedInput = normalizeBashInput(input);
+  const root = path.resolve(normalizedInput.root);
+  const cwd = resolveWithinRoot(root, normalizedInput.cwd);
+
+  if (typeof normalizedInput.command !== "string" || normalizedInput.command.trim().length === 0) {
+    throw new Error("bash.command 不能为空；兼容字段可使用 command、cmd 或 script");
+  }
 
   try {
-    const { stdout, stderr } = await execFileAsync("zsh", ["-lc", input.command], {
+    const { stdout, stderr } = await execFileAsync("zsh", ["-lc", normalizedInput.command], {
       cwd,
-      timeout: input.timeoutMs ?? 30_000,
+      timeout: normalizedInput.timeoutMs ?? 30_000,
       maxBuffer: 1024 * 1024,
     });
 
