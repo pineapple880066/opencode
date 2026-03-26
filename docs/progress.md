@@ -29,6 +29,8 @@
 - 第一批内建文件工具开始兼容更常见的外部 agent 参数风格：`file_path`、`old_string/oldString`、`new_string/newString`、`replace_all`
 - 这轮又继续把“修改后怎么验证”从 benchmark prompt 下沉到了 runtime：`LangGraphExecutionPhase` 新增了显式 `verify` phase，`executeNode` 现在会在真实 `edit/write` 之后检查“是否已经做过最小验证”；如果还没有验证，就通过 `VERIFICATION_POLICY` system message 强制下一轮进入 verify，而不是直接 finalize
 - 这条验证策略不仅拦“改完就收尾”，还会拦“验证失败后硬收尾”：如果最新改动后的第一次 verify 失败，runtime 会继续要求下一轮基于失败输出继续 modify 或再次 verify，而不是允许模型把失败测试当成最终结果直接包装掉
+- 这轮又把 verification policy 从“是否需要验证”推进到了“需要哪一类验证、验证到什么粒度才允许收尾”：runtime 现在会区分 `结构性验证` 和 `行为验证`，并且在上下文已经出现明确测试目标时，要求补齐 `目标化行为验证`；单纯 `py_compile / typecheck / lint / git diff --check` 这种结构性检查，不再能替代目标测试或局部回归
+- 与此同时，验证门槛也不再一刀切：如果任务明确声明“这次不改逻辑、只做结构性整理”，runtime 会要求最小结构性验证；如果只是纯注释/文档修改，runtime 仍然允许 edit 后直接 finalize，不会把低风险修改误拉进 verify
 - 工具合同层也跟着补了最小验证所需的 bash 参数兼容：`bash` 现在除了 `command/cwd/timeoutMs`，还兼容 `cmd`、`script`、`working_directory`、`workingDirectory` 和 `timeout_ms`，避免验证命令本身卡在协议阻抗上
 - 为了防止这条验证策略误伤低风险编辑，这轮还专门补了区分：纯注释/文档型修改不会被错误地强制进入 verify phase，但“修 bug / 改默认值 / 调参数 / 补校验”这类行为性修改会被要求在 finalize 前至少做一次最小验证
 - planning mode 工具拦截、第一批真实工具、subagent delegation / child session 生命周期也已经进入执行层，而不只是 schema/合同层
@@ -194,7 +196,7 @@
 - `packages/evals/src/minimax-smoke.ts` 已经提供真实模型 smoke 入口
 - `packages/db/src/env.ts` 已经把工作区级配置自动加载收敛成公共 helper
 - `2026-03-21` 已经用真实 `MiniMax` API key 跑通一次 smoke，拿到了 goal / plan / execute / review / summarize 的外部模型证据
-- 当前自动化验证已经到 `69` 个测试，全绿
+- 当前自动化验证已经到 `70` 个测试，全绿
 - `MiniMax` 适配层已经补上“超限数组自动裁剪”和“校验失败后 repair 重试”的回归测试
 - `MiniMax` 适配层已经补上“executor 从现有 state 补全缺失 task 字段”和“smoke 复用 session 参数解析”的回归测试
 - IDE 工作台已经补上“shell 渲染文件编辑表单”“浏览器保存文件”“服务端 save-file 边界”“无 session 时也能展示 workspace 文件预览”的测试
@@ -206,6 +208,8 @@
 - `RuntimeToolExecutor` 已经补上“bash 兼容 `cmd / working_directory / timeout_ms` 风格参数”的回归测试
 - MiniMax hooks 已经补上“executor 返回 `toolCalls` 请求 runtime 走真实工具循环”的回归测试
 - LangGraph 已经补上“行为性修改在真实 edit 后，没有 verify 不会直接 finalize；verify 失败后也不会直接收尾”的回归测试
+- LangGraph 已经补上“行为性修改在有明确测试目标时，结构性验证不足以收尾，必须补齐目标化行为验证”的回归测试
+- LangGraph 已经补上“纯结构性修改在真实 edit 后，做过最小结构性验证就可以 finalize”的回归测试
 - LangGraph 已经补上“纯注释修改不会被错误地强制进入 verify phase”的回归测试
 - MiniMax hooks 已经补上“executionPhase 会把 validation 这类别名归一化成 verify”的回归测试
 - benchmark 适配层已经补上“导出 CLI 参数解析”“JSON/JSONL 实例文件解析”“SWE-bench prompt 约束”和“默认 runId 格式”的回归测试
@@ -282,6 +286,134 @@
 - `packages/evals/scripts/export_swebench_lite_subset.py`
 - `docs/swebench-lite.md`
 
+## 2026-03-26：把 `requests-2148 / requests-2674` 暴露出的 failure class 下沉到 runtime
+
+这一轮不是继续堆 benchmark prompt，而是把两类剩余失败收进 agent 本体：
+
+- `2148` 暴露的是“行为修复补丁不完整”：agent 已经找对了方向，但只改了 import/comment 这种表层内容，就试图收尾。
+- `2674` 暴露的是“高风险共享路径上的修改过重”：目标测试可能已经过了，但 patch 在公共热路径上太激进，容易打坏一组 `PASS_TO_PASS` 回归。
+
+这次真正落到 runtime 的点有三类：
+
+1. `verification policy` 现在不再只是判断“要不要验证”，而是显式区分：
+   - 结构性验证
+   - 目标化行为验证
+   - 目标化行为验证 + 相邻回归验证
+2. `execute control loop` 现在会先挡住“只有 import/comment 级补丁就想 finalize”的情况，再要求进入 verify。
+   这个顺序很关键。否则 runtime 会先推 verify，导致模型带着半成品 patch 反复尝试收尾。
+3. `高风险共享路径` 现在会触发更强的验证门槛：主目标测试通过还不够，必须补一次同文件/同模块的相邻回归。
+
+关键代码：
+
+- `packages/runtime/src/langgraph.ts`
+  - `buildVerificationRequirement()`
+  - `commandLooksLikeAdjacentRegression()`
+  - `describeVerificationGap()`
+  - `executeNode()` 里的 `shouldForceSubstantiveBehaviorEdit / shouldForceStrongerVerification`
+- `apps/ide-web/src/minimax.ts`
+  - executor prompt 明确了：
+    - 行为修复不能只停在 import/comment
+    - 共享热路径优先最小增量 edit
+    - 高风险共享路径要补相邻回归
+- `packages/runtime/src/langgraph.test.ts`
+  - 新增两条回归：
+    - 表层 patch 不能冒充行为修复完成
+    - 高风险共享路径必须补相邻回归后才能 finalize
+
+验证证据：
+
+- `pnpm typecheck` 通过
+- `pnpm test -- --runInBand` 通过
+- 当前全量 `72` 个测试全绿
+
+这一步推进的是 agent 本体能力，不是 benchmark 特供逻辑：
+
+- prompt 可以告诉模型“应该怎么做”
+- 但真正决定“能不能 finalize”的，是 runtime 里的 gate
+- 这次变化已经从“模型最好这样做”推进到了“runtime 只允许这样收尾”
+
+## 2026-03-26：给 SWE-bench runner 补 instance timeout、阶段日志和增量落盘
+
+这一轮不是再改 prompt，而是先把 benchmark runner 做成可诊断的工具。
+
+之前 `psf__requests-2148 / psf__requests-2674` 在 headless runner 里出现过“第一条实例长时间无输出”的情况。问题不只是跑不完，而是 runner 当时只有最终收尾才写 `run-report.json` 和 `predictions.json`，所以一旦卡在 `runtime.langGraph.invoke()`，外部只能知道“程序没结束”，却不知道到底停在：
+
+- workspace 准备
+- runtime bootstrap
+- session 创建
+- 还是 graph invoke
+
+这次补了三块能力：
+
+1. `instance timeout`
+   - 每条实例现在都有独立的超时预算，默认 8 分钟，可通过 `--instance-timeout-ms` 或 `SWEBENCH_INSTANCE_TIMEOUT_MS` 覆盖。
+2. `阶段日志`
+   - 每条实例都会把 `prepare-workspace / runtime-bootstrap / create-session / invoke / collect-artifacts / runtime-dispose` 这些阶段写进 `stageLogs`，同时打印到控制台。
+3. `增量落盘`
+   - 现在不是等整个 batch 结束才一次性写报告，而是在每个实例的关键阶段都增量写 `run-report.json / predictions.json / instance-ids.txt`。
+
+关键代码：
+
+- `packages/evals/src/swebench-lite.ts`
+  - `readSweBenchLiteInvocation()` 新增 `instanceTimeoutMs`
+  - `withTimeout()` 统一包装实例级超时
+  - `persistSweBenchArtifacts()` 负责阶段性落盘
+  - `runSweBenchLite()` 现在按实例创建独立 runtime，并持续写入 `stageLogs`
+- `packages/evals/src/swebench-lite.test.ts`
+  - 新增了 `instance timeout` 参数解析回归
+
+这轮重新跑了两条 `requests` 实例：
+
+- `psf__requests-2148`
+  - 已完成，产出 patch，修改 `requests/models.py`
+- `psf__requests-2674`
+  - 明确在 `invoke:start` 阶段超时，5 分钟后被 runner 标成 `timed_out`
+
+这次最大的价值不是分数，而是把“卡住”从黑盒现象，推进成了可以直接归因的阶段性证据。
+
+## 2026-03-26：定位并修掉 `psf__requests-2674` 在 invoke 阶段打转的三个执行层问题
+
+有了阶段日志之后，`2674` 的问题就不再是“跑不完”，而是可以拆出具体根因：
+
+1. `edit` 工具合同不兼容 benchmark 风格字段
+   - 模型发的是 `search_replace / new_content`
+   - 工具层原来只认 `search / replace`
+   - 结果第一次真正想改代码时，直接因为字段名不兼容失败
+2. `view` 对目录输入直接报 `EISDIR`
+   - 模型一开始会用 `view(root, offset, limit)` 看工作区
+   - 原来的工具实现把目录当文件读，白白浪费了多轮工具预算
+3. benchmark runner 允许 delegation，但 headless 路径没有 child execution backend
+   - parent session 会创建 queued 的 subagent run
+   - child session 根本不执行
+   - 于是 parent summary 会出现“好像已经委托出去并推进了”的假象
+
+这次对应的代码修复：
+
+- `packages/tools/src/builtin.ts`
+  - `edit` 兼容 `search_replace / searchReplace / new_content / newContent`
+  - `view` 传目录时退化成目录预览，而不是直接 `EISDIR`
+- `packages/runtime/src/langgraph.ts`
+  - write-like 分析同步兼容 `search_replace / new_content`
+- `packages/evals/src/swebench-lite.ts`
+  - benchmark runner 显式禁用 `delegate`，强制 patch 生成留在当前 session 内完成
+- `packages/runtime/src/tooling.test.ts`
+  - 新增 `search_replace/new_content` 兼容测试
+  - 新增目录 `view` 退化成目录预览的测试
+
+真实结果：
+
+- 第一轮 rerun：
+  - `psf__requests-2674` 从“黑盒挂住”推进到“5 分钟超时 + 明确停在 invoke”
+- 修完上面三处后再次 rerun：
+  - `psf__requests-2674` 不再超时
+  - 产出 `1228 bytes` patch
+  - 官方 harness 不再是空 patch，也不再卡死
+  - 当前状态推进到了：
+    - `FAIL_TO_PASS = 0 failure`
+    - `PASS_TO_PASS = 4 failure`
+
+也就是说，这次修复已经把问题从“执行链卡住/产不出 patch”，推进成了“patch 已能产出，但还有回归要收”。
+
 ## 现在最应该继续做什么
 
 按优先级排序：
@@ -311,3 +443,50 @@
 2. 哪个硬门槛第一次被完整关闭了？
 3. 有没有新的场景测试？
 4. 有没有把“受保护术语”变成真实运行能力？
+
+## 2026-03-26：把高风险共享路径的最小改动预算和相邻回归命令选择器，下沉到 runtime
+
+这次不是继续往 benchmark prompt 里塞题目专用提示，而是把两条更通用的 runtime 策略真正落进 `execute control loop`：
+
+1. 高风险共享路径的最小改动预算
+   - 对 `adapters.py / sessions.py / models.py` 这类共享热路径上的行为修改，不再默认允许“大段 edit 先落地，再靠 verify 兜底”
+   - runtime 会在工具真正执行前分析这次 `edit/write`：
+     - 改了多少非空行
+     - 改了多少有效代码行
+     - 是否像宽范围控制流/异常映射重写
+   - 如果超过预算，会直接追加 `MODIFICATION_POLICY` 并拦下这次 edit，要求下一轮改成更小范围的增量修改
+2. 相邻回归验证命令选择器
+   - verification policy 不再只写“去跑同模块回归”
+   - runtime 会基于测试目标提示，尽量算出显式命令：
+     - 目标验证命令
+     - 相邻回归命令
+   - 这样 executor 在 verify phase 不只是看到文件名，而是能看到“最小验证命令应该长什么样”
+
+对应代码：
+
+- `packages/runtime/src/langgraph.ts`
+  - `extractTestSelectorHintsFromText()`：从上下文里抽 pytest/unittest 风格测试选择器
+  - `buildTargetedBehavioralCommands()`：生成最小目标验证命令
+  - `buildAdjacentRegressionCommands()`：生成相邻回归命令
+  - `buildModificationBudget()`：为高风险共享路径生成最小改动预算
+  - `explainModificationBudgetViolation()`：把超预算原因写成 `MODIFICATION_POLICY`
+  - `executeNode` 的工具循环里，现在会在 `toolExecutor.execute(...)` 之前先跑预算拦截
+- `packages/runtime/src/langgraph.test.ts`
+  - 新回归覆盖：
+    - import/comment 级补丁不能冒充行为修复
+    - 过宽 edit 会在执行前被 budget guard 拦下
+    - 高风险共享路径上的验证提示里会出现显式目标命令和相邻回归命令
+
+验证证据：
+
+- `pnpm typecheck`
+- `pnpm test -- --runInBand`
+- 当前全量 `75` 个测试全绿
+
+这一步推进的是 agent 本体能力，而不是只提 benchmark prompt 命中率。现在 runtime 已经能：
+
+- 在高风险共享路径上阻止过宽 patch 直接落盘
+- 把“相邻回归验证”从泛提示推进到命令级建议
+- 用代码 gate 决定什么时候还不能 finalize
+
+但这仍然不代表整体项目完成。DoD 里的 `memory / multi-session / subagent / planning mode / goal-driven workflow` 仍然整体是“部分完成”，不是全部关闭。

@@ -45,6 +45,7 @@ export interface ViewOutput {
   startLine: number;
   endLine: number;
   totalLines: number;
+  kind?: "file" | "directory";
 }
 
 export interface GrepInput extends WorkspaceBoundInput {
@@ -274,9 +275,15 @@ function normalizeEditInput(input: EditInput): EditInput {
     ...input,
     path: normalizeWorkspacePathInput(input),
     search:
-      pickStringAlias(input, ["search", "old_string", "oldString", "old_text", "oldText"]) ?? input.search,
+      pickStringAlias(
+        input,
+        ["search", "search_replace", "searchReplace", "old_string", "oldString", "old_text", "oldText"],
+      ) ?? input.search,
     replace:
-      pickStringAlias(input, ["replace", "new_string", "newString", "new_text", "newText"]) ?? input.replace,
+      pickStringAlias(
+        input,
+        ["replace", "new_content", "newContent", "new_string", "newString", "new_text", "newText"],
+      ) ?? input.replace,
     replaceAll:
       pickBooleanAlias(input, ["replaceAll", "replace_all"]) ??
       (expectedReplacements !== undefined ? expectedReplacements > 1 : input.replaceAll),
@@ -375,6 +382,38 @@ async function viewTool(input: ViewInput): Promise<ViewOutput> {
   const normalizedInput = normalizeViewInput(input);
   const root = path.resolve(normalizedInput.root);
   const targetPath = resolveWithinRoot(root, normalizedInput.path);
+  const targetStat = await stat(targetPath);
+
+  if (targetStat.isDirectory()) {
+    const directoryEntries = await readdir(targetPath, { withFileTypes: true });
+    const sortedEntries = directoryEntries
+      .filter((entry) => !entry.name.startsWith("."))
+      .sort((left, right) => left.name.localeCompare(right.name));
+
+    const startLine =
+      normalizedInput.startLine ??
+      (normalizedInput.offset !== undefined ? Math.max(1, normalizedInput.offset + 1) : 1);
+    const derivedEndLine =
+      normalizedInput.endLine ??
+      (normalizedInput.limit !== undefined
+        ? startLine + Math.max(0, normalizedInput.limit) - 1
+        : sortedEntries.length);
+    const endLine = Math.min(sortedEntries.length, Math.max(startLine, derivedEndLine));
+    const slicedEntries = sortedEntries.slice(startLine - 1, endLine);
+    const rendered = slicedEntries.map((entry) =>
+      `${entry.isDirectory() ? "dir" : "file"}\t${entry.name}`,
+    );
+
+    return {
+      path: toRelative(root, targetPath),
+      content: rendered.join("\n"),
+      startLine,
+      endLine: sortedEntries.length === 0 ? 0 : endLine,
+      totalLines: sortedEntries.length,
+      kind: "directory",
+    };
+  }
+
   const content = await readFile(targetPath, "utf8");
   const lines = content.split(/\r?\n/);
 
@@ -400,6 +439,7 @@ async function viewTool(input: ViewInput): Promise<ViewOutput> {
     startLine,
     endLine,
     totalLines: lines.length,
+    kind: "file",
   };
 }
 
@@ -553,11 +593,15 @@ async function editTool(input: EditInput): Promise<EditOutput> {
   const before = await readFile(targetPath, "utf8");
 
   if (typeof normalizedInput.search !== "string" || normalizedInput.search.length === 0) {
-    throw new Error("edit.search 不能为空；兼容字段可使用 search、old_string、oldString、old_text 或 oldText");
+    throw new Error(
+      "edit.search 不能为空；兼容字段可使用 search、search_replace、searchReplace、old_string、oldString、old_text 或 oldText",
+    );
   }
 
   if (typeof normalizedInput.replace !== "string") {
-    throw new Error("edit.replace 不能为空；兼容字段可使用 replace、new_string、newString、new_text 或 newText");
+    throw new Error(
+      "edit.replace 不能为空；兼容字段可使用 replace、new_content、newContent、new_string、newString、new_text 或 newText",
+    );
   }
 
   const occurrences = before.split(normalizedInput.search).length - 1;

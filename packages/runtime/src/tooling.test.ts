@@ -258,6 +258,46 @@ describe("RuntimeToolExecutor", () => {
     assert.equal(viewResult.output?.content, ["beta", "gamma"].join("\n"));
   });
 
+  test("build 模式的 view 工具在传入目录时会退化成目录预览，而不是直接报 EISDIR", async () => {
+    const store = new InMemoryRuntimeStore();
+    store.sessionMap.set("session_view_directory", {
+      id: "session_view_directory",
+      workspaceId: "workspace_1",
+      title: "view directory session",
+      status: "active",
+      activeAgentMode: "build",
+      summary: {
+        shortSummary: "",
+        openLoops: [],
+        nextActions: [],
+        importantFacts: [],
+      } satisfies SessionSummary,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    await writeFile(path.join(workspaceRoot, "notes", "dir-preview-a.txt"), "alpha", "utf8");
+    await writeFile(path.join(workspaceRoot, "notes", "dir-preview-b.txt"), "beta", "utf8");
+
+    const executor = new RuntimeToolExecutor(store, createBuiltinToolRegistry());
+    const viewResult = await executor.execute<any, { content: string; totalLines: number; kind?: string }>({
+      sessionId: "session_view_directory",
+      name: "view",
+      input: {
+        root: workspaceRoot,
+        path: "notes",
+        offset: 0,
+        limit: 10,
+      },
+    });
+
+    assert.equal(viewResult.ok, true);
+    assert.equal(viewResult.output?.kind, "directory");
+    assert.match(viewResult.output?.content ?? "", /file\tdir-preview-a\.txt/);
+    assert.match(viewResult.output?.content ?? "", /file\tdir-preview-b\.txt/);
+    assert.ok((viewResult.output?.totalLines ?? 0) >= 2);
+  });
+
   test("build 模式的 grep 工具兼容 pattern/keyword 别名，并且可以直接搜索单文件路径", async () => {
     const store = new InMemoryRuntimeStore();
     store.sessionMap.set("session_grep_pattern_alias", {
@@ -536,5 +576,52 @@ describe("RuntimeToolExecutor", () => {
 
     const updatedContent = await readFile(filePath, "utf8");
     assert.match(updatedContent, /%\((name)\)s:%\((filename)\)s:%\((lineno)\)d/);
+  });
+
+  test("build 模式的 edit 工具兼容 search_replace/new_content 这类 benchmark 风格参数", async () => {
+    const store = new InMemoryRuntimeStore();
+    store.sessionMap.set("session_edit_benchmark_aliases", {
+      id: "session_edit_benchmark_aliases",
+      workspaceId: "workspace_1",
+      title: "edit benchmark alias session",
+      status: "active",
+      activeAgentMode: "build",
+      summary: {
+        shortSummary: "",
+        openLoops: [],
+        nextActions: [],
+        importantFacts: [],
+      } satisfies SessionSummary,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const filePath = path.join(workspaceRoot, "notes", "alias-benchmark-test.ts");
+    await writeFile(
+      filePath,
+      [
+        "from .packages.urllib3.exceptions import ResponseError",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const executor = new RuntimeToolExecutor(store, createBuiltinToolRegistry());
+    const result = await executor.execute({
+      sessionId: "session_edit_benchmark_aliases",
+      name: "edit",
+      input: {
+        root: workspaceRoot,
+        path: "notes/alias-benchmark-test.ts",
+        search_replace: "from .packages.urllib3.exceptions import ResponseError",
+        new_content:
+          "from .packages.urllib3.exceptions import ResponseError\nfrom .packages.urllib3.exceptions import ClosedPoolError",
+      },
+    });
+
+    assert.equal(result.ok, true);
+
+    const updatedContent = await readFile(filePath, "utf8");
+    assert.match(updatedContent, /ClosedPoolError/);
   });
 });

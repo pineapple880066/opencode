@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import {
   Annotation,
   type BaseCheckpointSaver,
@@ -538,6 +540,63 @@ function createVerificationPolicyMessage(message: string): string {
   ].join("\n");
 }
 
+function createModificationPolicyMessage(message: string): string {
+  return [
+    "MODIFICATION_POLICY: 当前 invoke 已经进入行为修改阶段。",
+    message,
+  ].join("\n");
+}
+
+type VerificationLevel = "none" | "structural" | "behavioral";
+
+interface VerificationRequirement {
+  requiredLevel: VerificationLevel;
+  requireTargetedBehavioral: boolean;
+  requireAdjacentRegression: boolean;
+  recommendedCommandKinds: string[];
+  targetHints: string[];
+  adjacentHints: string[];
+  targetedCommands: string[];
+  adjacentCommands: string[];
+  rationale: string;
+}
+
+interface VerificationCommandAnalysis {
+  level: Exclude<VerificationLevel, "none">;
+  targeted: boolean;
+  adjacentRegression: boolean;
+}
+
+interface VerificationProgress {
+  attempted: boolean;
+  latestAttemptFailed: boolean;
+  strongestSuccessfulLevel: VerificationLevel;
+  hasTargetedBehavioralSuccess: boolean;
+  hasAdjacentRegressionSuccess: boolean;
+}
+
+interface WriteLikeModificationAnalysis {
+  path?: string;
+  documentationOnly: boolean;
+  importOnly: boolean;
+  substantialCodeChange: boolean;
+  changedLineCount: number;
+  meaningfulCodeLineCount: number;
+  broadFlowRewrite: boolean;
+  highRisk: boolean;
+  highRiskReason?: string;
+}
+
+interface ModificationBudget {
+  enforceMinimalDelta: boolean;
+  maxChangedLines: number;
+  maxMeaningfulCodeLines: number;
+  disallowBroadFlowRewrite: boolean;
+  targetHints: string[];
+  suggestedCommands: string[];
+  rationale: string;
+}
+
 /**
  * 基于用户消息的关键词简单启发式判断，是否存在“想让 agent 修改代码/文件”的意图。
  */
@@ -584,9 +643,315 @@ function textSuggestsBehavioralChange(value: string): boolean {
 
 function textSuggestsNoBehaviorChange(value: string): boolean {
   return (
-    /(不影响|不涉及|不会改动|不修改|只做|仅做|纯).{0,8}(行为|逻辑|功能|默认值|参数|校验|验证)/i.test(value)
+    /(不影响|不涉及|不会改动|不修改|不改|只做|仅做|纯).{0,8}(行为|逻辑|功能|默认值|参数|校验|验证)/i.test(value)
     || /(只加注释|仅加注释|纯注释|documentation-only|comment-only)/i.test(value)
   );
+}
+
+function pathLooksLikeDocumentationFile(filePath: string): boolean {
+  return /(^docs\/|\/docs\/|readme|changelog|license|copying|notice|\.md$|\.mdx$|\.rst$|\.txt$)/i.test(filePath);
+}
+
+function pathLooksLikeTestFile(filePath: string): boolean {
+  return /(^tests?\/|\/tests?\/|__tests__|\.test\.[^/]+$|\.spec\.[^/]+$|(^|\/)test_[^/]+\.py$|(^|\/)[^/]+_test\.go$)/i.test(
+    filePath,
+  );
+}
+
+function pathLooksLikeCodeFile(filePath: string): boolean {
+  return /\.(py|js|jsx|ts|tsx|go|rs|rb|java|c|cc|cpp|h|hpp|sh)$/i.test(filePath);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function extractPathHintsFromText(text: string): string[] {
+  const matches = text.match(/[\w./-]+\.(?:py|js|jsx|ts|tsx|go|rs|rb|java|c|cc|cpp|h|hpp|sh|md|mdx|rst|txt)/gi) ?? [];
+  return uniqueStrings(matches.map((value) => value.trim()));
+}
+
+function extractTestSelectorHintsFromText(text: string): string[] {
+  const pytestSelectors = text.match(/[\w./-]+\.py::[\w.:-]+(?:::[\w.:-]+)*/g) ?? [];
+  const dottedUnittestTargets = text.match(/\b(?:[\w]+\.tests?|tests?)\.[\w.]+\b/g) ?? [];
+
+  return uniqueStrings(
+    [...pytestSelectors, ...dottedUnittestTargets].filter((value) => /test/i.test(value)),
+  );
+}
+
+function pickStringAliasFromUnknown(
+  value: unknown,
+  aliases: string[],
+): string | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  for (const alias of aliases) {
+    const candidate = value[alias];
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+function stripSharedLineContext(
+  before: string,
+  after: string,
+): { beforeChanged: string; afterChanged: string } {
+  const beforeLines = before.split(/\r?\n/);
+  const afterLines = after.split(/\r?\n/);
+  let start = 0;
+  let beforeEnd = beforeLines.length - 1;
+  let afterEnd = afterLines.length - 1;
+
+  while (
+    start <= beforeEnd
+    && start <= afterEnd
+    && beforeLines[start] === afterLines[start]
+  ) {
+    start += 1;
+  }
+
+  while (
+    beforeEnd >= start
+    && afterEnd >= start
+    && beforeLines[beforeEnd] === afterLines[afterEnd]
+  ) {
+    beforeEnd -= 1;
+    afterEnd -= 1;
+  }
+
+  return {
+    beforeChanged: beforeLines.slice(start, beforeEnd + 1).join("\n"),
+    afterChanged: afterLines.slice(start, afterEnd + 1).join("\n"),
+  };
+}
+
+function isBlankLine(line: string): boolean {
+  return line.trim().length === 0;
+}
+
+function isCommentLikeLine(line: string): boolean {
+  return /^\s*(#|\/\/|\/\*|\*|<!--|"""|''')/.test(line);
+}
+
+function isImportLikeLine(line: string): boolean {
+  return /^\s*(import\s+|from\s+\S+\s+import\s+|package\s+|use\s+\S+|#include\s+|require\(|export\s+\{)/.test(line);
+}
+
+function isDocstringBoundaryLine(line: string): boolean {
+  return /^\s*("""|''')/.test(line);
+}
+
+function isMeaningfulCodeLine(line: string): boolean {
+  return !isBlankLine(line)
+    && !isCommentLikeLine(line)
+    && !isImportLikeLine(line)
+    && !isDocstringBoundaryLine(line);
+}
+
+function countMeaningfulCodeLines(text: string): number {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => isMeaningfulCodeLine(line))
+    .length;
+}
+
+function pathLooksLikeHighRiskSharedCode(filePath: string): boolean {
+  if (!pathLooksLikeCodeFile(filePath) || pathLooksLikeTestFile(filePath) || pathLooksLikeDocumentationFile(filePath)) {
+    return false;
+  }
+
+  return /(^|\/)(adapters?|sessions?|models?|api|client|transport|router|middleware|requests?|responses?|utils?)\.[^/]+$/i.test(
+    filePath,
+  ) || /(^|\/)(adapter|session|model|api|client|transport|router|middleware|request|response|core|utils?)(\/|$)/i.test(
+    filePath,
+  );
+}
+
+function changeTextLooksHighRisk(text: string): boolean {
+  const nonBlankLines = text.split(/\r?\n/).filter((line) => line.trim().length > 0).length;
+  const exceptCount = (text.match(/\bexcept\b/g) ?? []).length + (text.match(/\bcatch\b/g) ?? []).length;
+  const tryCount = (text.match(/\btry\b/g) ?? []).length;
+  const broadRequestFlowTouch =
+    /\b(conn\.urlopen|HTTPResponse\.from_httplib|_get_conn|putrequest|timeout\s*=|retries\s*=|raise\s+\w+Error)\b/.test(
+      text,
+    );
+
+  return nonBlankLines >= 12 || exceptCount >= 2 || (tryCount >= 1 && exceptCount >= 1) || broadRequestFlowTouch;
+}
+
+function readWriteLikeChangeSegments(input: unknown): { before?: string; after?: string } {
+  const search = pickStringAliasFromUnknown(input, [
+    "search",
+    "search_replace",
+    "searchReplace",
+    "old_string",
+    "oldString",
+    "old_text",
+    "oldText",
+  ]);
+  const replace = pickStringAliasFromUnknown(input, [
+    "replace",
+    "new_content",
+    "newContent",
+    "new_string",
+    "newString",
+    "new_text",
+    "newText",
+  ]);
+  if (typeof search === "string" && typeof replace === "string") {
+    return {
+      before: search,
+      after: replace,
+    };
+  }
+
+  const content = pickStringAliasFromUnknown(input, [
+    "content",
+    "contents",
+    "new_content",
+    "newContent",
+    "new_string",
+    "newString",
+    "new_text",
+    "newText",
+  ]);
+  if (typeof content === "string") {
+    return {
+      after: content,
+    };
+  }
+
+  return {};
+}
+
+function analyzeWriteLikeModification(toolCall: LangGraphToolCall): WriteLikeModificationAnalysis | null {
+  if (toolCall.name !== "edit" && toolCall.name !== "write") {
+    return null;
+  }
+
+  const path = readToolCallPath(toolCall);
+  if (!path) {
+    return null;
+  }
+
+  const { before, after } = readWriteLikeChangeSegments(toolCall.input);
+  const isolated = typeof before === "string" && typeof after === "string"
+    ? stripSharedLineContext(before, after)
+    : { beforeChanged: "", afterChanged: after ?? "" };
+  const changedText = [isolated.beforeChanged, isolated.afterChanged]
+    .filter((chunk) => chunk.trim().length > 0)
+    .join("\n");
+  const changedLines = changedText.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const meaningfulCodeLineCount = countMeaningfulCodeLines(changedText);
+  const broadFlowRewrite = changeTextLooksHighRisk(changedText);
+  const documentationOnly = changedLines.length > 0 && changedLines.every((line) => !isMeaningfulCodeLine(line) && !isImportLikeLine(line));
+  const importOnly = changedLines.length > 0 && meaningfulCodeLineCount === 0 && changedLines.some((line) => isImportLikeLine(line));
+  const substantialCodeChange =
+    pathLooksLikeCodeFile(path)
+    && !pathLooksLikeDocumentationFile(path)
+    && meaningfulCodeLineCount > 0;
+  const highRisk = substantialCodeChange && pathLooksLikeHighRiskSharedCode(path);
+
+  return {
+    path,
+    documentationOnly,
+    importOnly,
+    substantialCodeChange,
+    changedLineCount: changedLines.length,
+    meaningfulCodeLineCount,
+    broadFlowRewrite,
+    highRisk,
+    highRiskReason: highRisk
+      ? `路径 ${path} 属于共享热路径，需要最小增量 edit 和更严格的相邻回归验证。`
+      : undefined,
+  };
+}
+
+function buildModificationBudget(
+  state: AgentGraphState,
+  userMessage: string | undefined,
+  analysis: WriteLikeModificationAnalysis,
+): ModificationBudget {
+  // 最小改动预算只在“高风险共享路径 + 行为修复”开启。
+  // 目的不是限制所有 edit，而是拦住在 adapters/sessions/models 这类公共热路径上
+  // 直接复制大段流程、包宽泛异常处理、一次改太多语义分支的 patch。
+  const corpus = collectVerificationIntentText(state, userMessage);
+  const behavioralChange = textSuggestsBehavioralChange(corpus) && !textSuggestsNoBehaviorChange(corpus);
+  const targetHints = collectVerificationTargetHints(
+    state,
+    userMessage,
+    analysis.path ? [analysis.path] : [],
+  );
+  const suggestedCommands = buildTargetedBehavioralCommands(targetHints);
+
+  if (!behavioralChange || !analysis.highRisk) {
+    return {
+      enforceMinimalDelta: false,
+      maxChangedLines: 0,
+      maxMeaningfulCodeLines: 0,
+      disallowBroadFlowRewrite: false,
+      targetHints,
+      suggestedCommands,
+      rationale: "当前修改不属于高风险共享路径上的行为修复，不启用最小改动预算。",
+    };
+  }
+
+  return {
+    enforceMinimalDelta: true,
+    maxChangedLines: 24,
+    maxMeaningfulCodeLines: 14,
+    disallowBroadFlowRewrite: true,
+    targetHints,
+    suggestedCommands,
+    rationale:
+      "共享热路径上的行为修复优先最小增量 edit，避免复制整段主流程、包一层过宽 try/except，或一次改动过多语义分支。",
+  };
+}
+
+function explainModificationBudgetViolation(
+  budget: ModificationBudget,
+  analysis: WriteLikeModificationAnalysis,
+): string | undefined {
+  if (!budget.enforceMinimalDelta) {
+    return undefined;
+  }
+
+  const reasons: string[] = [];
+
+  if (budget.disallowBroadFlowRewrite && analysis.broadFlowRewrite) {
+    reasons.push("这次 edit 像宽范围控制流/异常映射重写，不是最小增量补丁。");
+  }
+
+  if (analysis.changedLineCount > budget.maxChangedLines) {
+    reasons.push(`这次 edit 触及 ${analysis.changedLineCount} 个非空行，超过当前预算 ${budget.maxChangedLines}。`);
+  }
+
+  if (analysis.meaningfulCodeLineCount > budget.maxMeaningfulCodeLines) {
+    reasons.push(
+      `这次 edit 含 ${analysis.meaningfulCodeLineCount} 个有效代码行，超过当前预算 ${budget.maxMeaningfulCodeLines}。`,
+    );
+  }
+
+  if (reasons.length === 0) {
+    return undefined;
+  }
+
+  return [
+    budget.rationale,
+    analysis.path ? `目标路径：${analysis.path}` : undefined,
+    ...reasons,
+    budget.targetHints.length > 0 ? `优先围绕这些测试目标做小改动：${budget.targetHints.join("、")}` : undefined,
+    budget.suggestedCommands.length > 0 ? `修改后优先验证：${budget.suggestedCommands.join("；")}` : undefined,
+    "请改成更小范围的 edit：优先命中现有异常边界、条件分支或返回值分支，而不是复制整段共享路径。",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
 
 function collectVerificationIntentText(state: AgentGraphState, userMessage: string | undefined): string {
@@ -603,25 +968,202 @@ function collectVerificationIntentText(state: AgentGraphState, userMessage: stri
     .join("\n");
 }
 
-function shouldRequirePostWriteVerification(
+function collectRecentTouchedPaths(state: AgentGraphState): string[] {
+  const paths: string[] = [];
+
+  for (const log of state.toolInvocations) {
+    const parsedInput = parseToolLogInput(log.inputJson);
+    const path = readPathFromUnknownInput(parsedInput);
+    if (path) {
+      paths.push(path);
+    }
+  }
+
+  return uniqueStrings(paths);
+}
+
+function collectVerificationTargetHints(
   state: AgentGraphState,
   userMessage: string | undefined,
-): boolean {
+  modifiedPaths: string[],
+): string[] {
+  const corpus = collectVerificationIntentText(state, userMessage);
+  const testSelectorHints = extractTestSelectorHintsFromText(corpus);
+  const textPathHints = extractPathHintsFromText(corpus).filter((path) => pathLooksLikeTestFile(path));
+  const recentTestPaths = collectRecentTouchedPaths(state).filter((path) => pathLooksLikeTestFile(path));
+  const modifiedTestPaths = modifiedPaths.filter((path) => pathLooksLikeTestFile(path));
+
+  return uniqueStrings([
+    ...testSelectorHints,
+    ...textPathHints,
+    ...recentTestPaths,
+    ...modifiedTestPaths,
+  ]).slice(0, 3);
+}
+
+function collectAdjacentRegressionHints(
+  targetHints: string[],
+  highRiskPaths: string[],
+): string[] {
+  if (targetHints.length === 0 && highRiskPaths.length === 0) {
+    return [];
+  }
+
+  return uniqueStrings([
+    ...targetHints,
+    ...highRiskPaths.map((filePath) => path.basename(filePath)),
+  ]).slice(0, 3);
+}
+
+function buildPytestTargetCommand(targetHint: string): string | undefined {
+  if (!targetHint.includes(".py::")) {
+    return undefined;
+  }
+
+  return `python3 -m pytest ${targetHint}`;
+}
+
+function findUnittestModuleTarget(targetHint: string): string | undefined {
+  if (!/^\w[\w.]*$/.test(targetHint) || !/test/i.test(targetHint)) {
+    return undefined;
+  }
+
+  const parts = targetHint.split(".");
+  let lastModuleIndex = -1;
+
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (/^[a-z0-9_]+$/.test(part) && /test/i.test(part)) {
+      lastModuleIndex = index;
+    }
+  }
+
+  if (lastModuleIndex === -1) {
+    return undefined;
+  }
+
+  return parts.slice(0, lastModuleIndex + 1).join(".");
+}
+
+function buildTargetedBehavioralCommands(targetHints: string[]): string[] {
+  // 这里不自动执行命令，只负责把“当前最小目标验证命令”显式算出来，
+  // 再写进 policy message，逼 executor 在 verify phase 用更贴近修改点的命令。
+  const commands: string[] = [];
+
+  for (const targetHint of targetHints) {
+    const pytestCommand = buildPytestTargetCommand(targetHint);
+    if (pytestCommand) {
+      commands.push(pytestCommand);
+      continue;
+    }
+
+    if (pathLooksLikeTestFile(targetHint)) {
+      commands.push(`python3 -m pytest ${targetHint}`);
+      continue;
+    }
+
+    if (findUnittestModuleTarget(targetHint)) {
+      commands.push(`python3 -m unittest ${targetHint}`);
+    }
+  }
+
+  return uniqueStrings(commands).slice(0, 2);
+}
+
+function buildAdjacentRegressionCommands(
+  targetHints: string[],
+  adjacentHints: string[],
+): string[] {
+  // 相邻回归命令选择器会尽量从单 case 退回到同文件/同模块，
+  // 避免只跑一个 target 就收尾。
+  const commands: string[] = [];
+
+  for (const targetHint of targetHints) {
+    if (targetHint.includes(".py::")) {
+      commands.push(`python3 -m pytest ${targetHint.split("::")[0]}`);
+      continue;
+    }
+
+    const unittestModule = findUnittestModuleTarget(targetHint);
+    if (unittestModule) {
+      commands.push(`python3 -m unittest ${unittestModule}`);
+    }
+  }
+
+  for (const adjacentHint of adjacentHints) {
+    if (pathLooksLikeTestFile(adjacentHint)) {
+      commands.push(`python3 -m pytest ${adjacentHint}`);
+      continue;
+    }
+
+    const unittestModule = findUnittestModuleTarget(adjacentHint);
+    if (unittestModule) {
+      commands.push(`python3 -m unittest ${unittestModule}`);
+    }
+  }
+
+  return uniqueStrings(commands).slice(0, 2);
+}
+
+// buildVerificationRequirement 是当前 verification policy 的核心。
+// 它不再只回答一个布尔问题“要不要验证”，而是显式返回：
+// - 当前需要的是结构性验证，还是行为验证
+// - 如果已经有明确测试目标，是否必须做到“目标化行为验证”
+// - 对下一轮 executor 最有价值的验证建议是什么
+//
+// 这样 executeNode 的放行条件就能从“看到一次 bash 就算验证过了”
+// 推进到“这次 bash 的类型和粒度，到底够不够支持 finalize”。
+function buildVerificationRequirement(
+  state: AgentGraphState,
+  userMessage: string | undefined,
+  modifiedPaths: string[],
+  highRiskPaths: string[],
+): VerificationRequirement {
   const userIntent = userMessage ?? "";
   if (textSuggestsDocumentationOnly(userIntent) && !textSuggestsBehavioralChange(userIntent)) {
-    return false;
+    return {
+      requiredLevel: "none",
+      requireTargetedBehavioral: false,
+      requireAdjacentRegression: false,
+      recommendedCommandKinds: [],
+      targetHints: [],
+      adjacentHints: [],
+      targetedCommands: [],
+      adjacentCommands: [],
+      rationale: "当前请求本身更像纯说明/注释任务，不需要额外验证。",
+    };
   }
 
   const corpus = collectVerificationIntentText(state, userMessage);
   if (corpus.trim().length === 0) {
-    return false;
+    return {
+      requiredLevel: "none",
+      requireTargetedBehavioral: false,
+      requireAdjacentRegression: false,
+      recommendedCommandKinds: [],
+      targetHints: [],
+      adjacentHints: [],
+      targetedCommands: [],
+      adjacentCommands: [],
+      rationale: "当前没有足够上下文判断验证需求。",
+    };
   }
 
   if (
     textSuggestsDocumentationOnly(corpus)
     && !textSuggestsBehavioralChange(corpus)
   ) {
-    return false;
+    return {
+      requiredLevel: "none",
+      requireTargetedBehavioral: false,
+      requireAdjacentRegression: false,
+      recommendedCommandKinds: [],
+      targetHints: [],
+      adjacentHints: [],
+      targetedCommands: [],
+      adjacentCommands: [],
+      rationale: "当前 goal / plan / task 都更像文档型修改，不需要额外验证。",
+    };
   }
 
   if (
@@ -629,10 +1171,292 @@ function shouldRequirePostWriteVerification(
     && textSuggestsNoBehaviorChange(corpus)
     && !textSuggestsBehavioralChange(userIntent)
   ) {
+    return {
+      requiredLevel: "none",
+      requireTargetedBehavioral: false,
+      requireAdjacentRegression: false,
+      recommendedCommandKinds: [],
+      targetHints: [],
+      adjacentHints: [],
+      targetedCommands: [],
+      adjacentCommands: [],
+      rationale: "当前上下文明确声明这次修改不涉及行为变化。",
+    };
+  }
+
+  const targetHints = collectVerificationTargetHints(state, userMessage, modifiedPaths);
+  const adjacentHints = collectAdjacentRegressionHints(targetHints, highRiskPaths);
+  const targetedCommands = buildTargetedBehavioralCommands(targetHints);
+  const adjacentCommands = buildAdjacentRegressionCommands(targetHints, adjacentHints);
+  const modifiedCodePaths = modifiedPaths.filter((path) => pathLooksLikeCodeFile(path));
+  const explicitNoBehaviorChange = textSuggestsNoBehaviorChange(corpus) || textSuggestsNoBehaviorChange(userIntent);
+  const behavioralChange = !explicitNoBehaviorChange && textSuggestsBehavioralChange(corpus);
+
+  if (behavioralChange) {
+    const requireAdjacentRegression = highRiskPaths.length > 0 && targetHints.length > 0;
+    const recommendedCommandKinds = requireAdjacentRegression
+      ? [
+          `当前修改命中了高风险共享路径：${highRiskPaths.join("、")}`,
+          `先跑主目标，再补同文件/同模块的相邻回归：${adjacentHints.join("、")}`,
+          "不要只跑单个 case 就 finalize，至少做整文件/整模块级行为验证",
+        ]
+      : targetHints.length > 0
+        ? [
+            `优先跑与这些目标直接相关的局部测试/局部回归：${targetHints.join("、")}`,
+            "不要只跑结构性检查（如 py_compile、typecheck、lint、git diff --check）就收尾",
+          ]
+        : [
+            "优先跑最小行为验证：单测、局部回归、单文件测试或单用例测试",
+            "只有结构性检查通过还不够，至少要有一次真正的行为级验证",
+          ];
+
+    return {
+      requiredLevel: "behavioral",
+      requireTargetedBehavioral: targetHints.length > 0,
+      requireAdjacentRegression,
+      recommendedCommandKinds,
+      targetHints,
+      adjacentHints,
+      targetedCommands,
+      adjacentCommands,
+      rationale:
+        requireAdjacentRegression
+          ? "当前请求属于行为性修改，而且已经触达高风险共享路径；如果只验证主目标而不补相邻回归，很容易引入旧语义回归。"
+          : targetHints.length > 0
+            ? "当前请求属于行为性修改，而且上下文里已经出现了具体测试/回归目标。"
+            : "当前请求属于行为性修改，结构性验证不足以证明补丁正确。",
+    };
+  }
+
+  if (looksLikeModificationRequest(userMessage) || hasPendingModificationWork(state) || modifiedCodePaths.length > 0) {
+    return {
+      requiredLevel: "structural",
+      requireTargetedBehavioral: false,
+      requireAdjacentRegression: false,
+      recommendedCommandKinds: [
+        modifiedCodePaths.length > 0
+          ? `优先围绕已修改文件做最小结构性验证：${modifiedCodePaths.slice(0, 3).join("、")}`
+          : "优先围绕已修改文件做最小结构性验证",
+        "可选形式包括 git diff --check、语法检查、类型检查、lint 或最小 build",
+      ],
+      targetHints: [],
+      adjacentHints: [],
+      targetedCommands: [],
+      adjacentCommands: [],
+      rationale: "当前修改看起来不直接改变业务行为，但仍然需要至少一轮结构性验证再收尾。",
+    };
+  }
+
+  return {
+    requiredLevel: "none",
+    requireTargetedBehavioral: false,
+    requireAdjacentRegression: false,
+    recommendedCommandKinds: [],
+    targetHints: [],
+    adjacentHints: [],
+    targetedCommands: [],
+    adjacentCommands: [],
+    rationale: "当前没有识别到需要额外验证的修改风险。",
+  };
+}
+
+function formatVerificationRequirement(requirement: VerificationRequirement): string {
+  if (requirement.requiredLevel === "none") {
+    return "当前无需额外验证。";
+  }
+
+  const levelLabel =
+    requirement.requiredLevel === "behavioral"
+      ? requirement.requireAdjacentRegression
+        ? "目标化行为验证 + 相邻回归验证"
+        : requirement.requireTargetedBehavioral
+          ? "目标化行为验证"
+          : "行为验证"
+      : "结构性验证";
+
+  const lines = [
+    `当前验证门槛：${levelLabel}。`,
+    `原因：${requirement.rationale}`,
+  ];
+
+  if (requirement.targetHints.length > 0) {
+    lines.push(`优先目标：${requirement.targetHints.join("、")}`);
+  }
+
+  if (requirement.adjacentHints.length > 0) {
+    lines.push(`相邻回归：${requirement.adjacentHints.join("、")}`);
+  }
+
+  if (requirement.targetedCommands.length > 0) {
+    lines.push(`目标验证命令：${requirement.targetedCommands.join("；")}`);
+  }
+
+  if (requirement.adjacentCommands.length > 0) {
+    lines.push(`相邻回归命令：${requirement.adjacentCommands.join("；")}`);
+  }
+
+  if (requirement.recommendedCommandKinds.length > 0) {
+    lines.push(`建议验证：${requirement.recommendedCommandKinds.join("；")}`);
+  }
+
+  return lines.join("\n");
+}
+
+function commandLooksLikeBehavioralVerification(command: string | undefined): boolean {
+  if (!command) {
     return false;
   }
 
-  return textSuggestsBehavioralChange(corpus);
+  return /\b(pytest|unittest|vitest|jest|mocha|ava|tox|nox|phpunit|rspec)\b/i.test(command)
+    || /\b(go test|cargo test|mvn test|gradle test|make test)\b/i.test(command)
+    || /\b(pnpm test|npm test|npm run test|yarn test)\b/i.test(command);
+}
+
+function commandLooksLikeStructuralVerification(command: string | undefined): boolean {
+  if (!command) {
+    return false;
+  }
+
+  return /\b(go vet|cargo check|go build|tsc\b|eslint\b|ruff check|mypy\b|py_compile|git diff --check|typecheck|lint|build|compile|check|node --check)\b/i.test(
+    command,
+  );
+}
+
+function commandLooksTargeted(command: string | undefined): boolean {
+  if (!command) {
+    return false;
+  }
+
+  return /(::| -k | -m | --grep | --filter | -run )/.test(command)
+    || /(?:^|\s)[\w./-]+\.(?:py|js|jsx|ts|tsx|go|rs|rb|java|c|cc|cpp|h|hpp|sh)(?:\s|$)/i.test(command)
+    || /\btests?\.[\w.]+\b/i.test(command)
+    || /\btests?\/[\w./-]+\b/i.test(command);
+}
+
+function commandLooksLikeAdjacentRegression(command: string | undefined): boolean {
+  if (!command) {
+    return false;
+  }
+
+  const explicitSelectors = command.match(/[\w./-]+\.py::[\w.:-]+(?:::[\w.:-]+)?/g) ?? [];
+  const dottedUnittestTargets = command.match(/\btests?\.[\w.]+\b/g) ?? [];
+  const hasWholeModuleTarget = dottedUnittestTargets.some((target) => (target.match(/\./g) ?? []).length <= 2);
+  const runsWholeTestFileOrModule =
+    explicitSelectors.length === 0
+    && (
+      /(?:^|\s)[\w./-]*test[\w./-]*\.py(?:\s|$)/i.test(command)
+      || /(?:^|\s)tests?\/[\w./-]+(?:\s|$)/i.test(command)
+      || hasWholeModuleTarget
+    );
+
+  return runsWholeTestFileOrModule || explicitSelectors.length > 1;
+}
+
+function analyzeVerificationCommand(command: string | undefined): VerificationCommandAnalysis | null {
+  if (!command) {
+    return null;
+  }
+
+  if (commandLooksLikeBehavioralVerification(command)) {
+    return {
+      level: "behavioral",
+      targeted: commandLooksTargeted(command),
+      adjacentRegression: commandLooksLikeAdjacentRegression(command),
+    };
+  }
+
+  if (commandLooksLikeStructuralVerification(command)) {
+    return {
+      level: "structural",
+      targeted: false,
+      adjacentRegression: false,
+    };
+  }
+
+  return null;
+}
+
+function commandLooksLikeVerification(command: string | undefined): boolean {
+  return analyzeVerificationCommand(command) !== null;
+}
+
+function satisfiesVerificationRequirement(
+  requirement: VerificationRequirement,
+  progress: VerificationProgress,
+): boolean {
+  if (requirement.requiredLevel === "none") {
+    return true;
+  }
+
+  if (!progress.attempted || progress.latestAttemptFailed) {
+    return false;
+  }
+
+  if (requirement.requiredLevel === "structural") {
+    return progress.strongestSuccessfulLevel === "structural" || progress.strongestSuccessfulLevel === "behavioral";
+  }
+
+  if (requirement.requireAdjacentRegression) {
+    return progress.hasAdjacentRegressionSuccess;
+  }
+
+  if (requirement.requireTargetedBehavioral) {
+    return progress.hasTargetedBehavioralSuccess;
+  }
+
+  return progress.strongestSuccessfulLevel === "behavioral";
+}
+
+function describeVerificationGap(
+  requirement: VerificationRequirement,
+  progress: VerificationProgress,
+): string {
+  if (requirement.requiredLevel === "none") {
+    return "当前没有额外验证缺口。";
+  }
+
+  if (!progress.attempted) {
+    return "最新改动之后还没有任何验证尝试。";
+  }
+
+  if (progress.latestAttemptFailed) {
+    return "最近一次验证明确失败了。";
+  }
+
+  if (requirement.requiredLevel === "behavioral") {
+    if (requirement.requireAdjacentRegression && !progress.hasAdjacentRegressionSuccess) {
+      return "已经有成功验证，但当前仍缺少一次相邻回归验证。";
+    }
+
+    if (requirement.requireTargetedBehavioral && !progress.hasTargetedBehavioralSuccess) {
+      return "已经有成功验证，但粒度还不够；当前仍缺少一次目标化行为验证。";
+    }
+
+    if (progress.strongestSuccessfulLevel !== "behavioral") {
+      return "已经有成功验证，但仍然只有结构性验证，缺少行为级验证。";
+    }
+  }
+
+  return "当前验证尚未满足运行时门槛。";
+}
+
+function pickStrongerVerificationLevel(
+  current: VerificationLevel,
+  candidate: VerificationLevel,
+): VerificationLevel {
+  if (current === "behavioral" || candidate === "none") {
+    return current;
+  }
+
+  if (candidate === "behavioral") {
+    return "behavioral";
+  }
+
+  if (current === "structural" || candidate === "structural") {
+    return "structural";
+  }
+
+  return current;
 }
 
 /**
@@ -746,17 +1570,6 @@ function readBashCommand(input: unknown): string | undefined {
 
   const command = input.command ?? input.cmd ?? input.script;
   return typeof command === "string" && command.trim().length > 0 ? command.trim() : undefined;
-}
-
-function commandLooksLikeVerification(command: string | undefined): boolean {
-  if (!command) {
-    return false;
-  }
-
-  return /\b(pytest|unittest|vitest|jest|mocha|ava|tox|nox|phpunit|rspec)\b/i.test(command)
-    || /\b(go test|go vet|cargo test|cargo check|mvn test|gradle test|make test)\b/i.test(command)
-    || /\b(pnpm test|pnpm typecheck|pnpm lint|npm test|npm run test|npm run lint|yarn test)\b/i.test(command)
-    || /\b(tsc\b|eslint\b|ruff check|mypy\b|py_compile|git diff --check|verify|verification|typecheck|lint|build|compile|check)\b/i.test(command);
 }
 
 function readBashExitCode(output: unknown): number | undefined {
@@ -1097,12 +1910,19 @@ export function createAgentLangGraph(
     let executedToolCalls = 0;
     let duplicateToolCalls = 0;
     let executedWriteLikeTool = false;
+    let hasSubstantiveBehavioralEdit = false;
     let lastSuccessfulToolCallKey: string | undefined;
     const viewReadBudgets = new Map<string, ViewReadBudgetState>();
-    let writeGeneration = 0;
-    let verificationAttemptGeneration = 0;
-    let verificationSuccessGeneration = 0;
-    let verificationFailureGeneration = 0;
+    const modifiedPathsSinceLatestWrite = new Set<string>();
+    const superficialBehaviorPaths = new Set<string>();
+    const highRiskModifiedPaths = new Set<string>();
+    let verificationProgress: VerificationProgress = {
+      attempted: false,
+      latestAttemptFailed: false,
+      strongestSuccessfulLevel: "none",
+      hasTargetedBehavioralSuccess: false,
+      hasAdjacentRegressionSuccess: false,
+    };
 
     for (let round = 0; round < maxToolRounds; round += 1) {
       const execution = await hooks.executor(runtimeState, {
@@ -1121,15 +1941,16 @@ export function createAgentLangGraph(
       const toolCalls = (execution.toolCalls ?? []).slice(0, maxToolCallsPerRound);
       const executionPhase = inferExecutionPhase(execution);
       const hasModificationAnchor = hasLocatedModificationAnchor(runtimeState);
-      const requiresVerification = shouldRequirePostWriteVerification(runtimeState, state.userMessage);
-      const hasVerificationAttemptSinceLatestWrite =
-        writeGeneration > 0 && verificationAttemptGeneration >= writeGeneration;
-      const hasSuccessfulVerificationSinceLatestWrite =
-        writeGeneration > 0 && verificationSuccessGeneration >= writeGeneration;
-      const hasFailedVerificationSinceLatestWrite =
-        writeGeneration > 0
-        && verificationFailureGeneration >= writeGeneration
-        && verificationSuccessGeneration < writeGeneration;
+      const verificationRequirement = buildVerificationRequirement(
+        runtimeState,
+        state.userMessage,
+        [...modifiedPathsSinceLatestWrite],
+        [...highRiskModifiedPaths],
+      );
+      const hasSatisfiedVerificationSinceLatestWrite = satisfiesVerificationRequirement(
+        verificationRequirement,
+        verificationProgress,
+      );
       const shouldForceModifyAfterKnownRead =
         toolCalls.length > 0
         && executionPhase !== "finalize"
@@ -1152,14 +1973,38 @@ export function createAgentLangGraph(
         && hasModificationAnchor
         && round < maxToolRounds - 1;
       const shouldForceVerificationBeforeFinalize =
-        requiresVerification
-        && writeGeneration > 0
-        && !hasVerificationAttemptSinceLatestWrite
+        verificationRequirement.requiredLevel !== "none"
+        && modifiedPathsSinceLatestWrite.size > 0
+        && !verificationProgress.attempted
         && (toolCalls.length === 0 || executionPhase === "finalize")
         && round < maxToolRounds - 1;
+      const shouldForceSubstantiveBehaviorEdit =
+        verificationRequirement.requiredLevel === "behavioral"
+        && modifiedPathsSinceLatestWrite.size > 0
+        && executedWriteLikeTool
+        && !hasSubstantiveBehavioralEdit
+        && (toolCalls.length === 0 || executionPhase === "finalize" || executionPhase === "verify")
+        && round < maxToolRounds - 1;
       const shouldForceRetryAfterFailedVerification =
-        requiresVerification
-        && hasFailedVerificationSinceLatestWrite
+        verificationRequirement.requiredLevel !== "none"
+        && modifiedPathsSinceLatestWrite.size > 0
+        && verificationProgress.attempted
+        && verificationProgress.latestAttemptFailed
+        && (toolCalls.length === 0 || executionPhase === "finalize")
+        && round < maxToolRounds - 1;
+      // 这里处理的是“verify 虽然成功了，但等级不够”的情况。
+      // 典型例子：
+      // - 行为性修改只跑了 py_compile / typecheck
+      // - 已经出现明确测试目标，但只跑了一个宽泛的 smoke check
+      //
+      // 这类情况如果直接 finalize，用户会看到“验证成功”的假象，
+      // 但 runtime 其实还没有拿到足够贴近修改点的证据。
+      const shouldForceStrongerVerification =
+        verificationRequirement.requiredLevel !== "none"
+        && modifiedPathsSinceLatestWrite.size > 0
+        && verificationProgress.attempted
+        && !verificationProgress.latestAttemptFailed
+        && !hasSatisfiedVerificationSinceLatestWrite
         && (toolCalls.length === 0 || executionPhase === "finalize")
         && round < maxToolRounds - 1;
 
@@ -1198,12 +2043,34 @@ export function createAgentLangGraph(
         continue;
       }
 
+      if (shouldForceSubstantiveBehaviorEdit) {
+        const superficialPaths = [...superficialBehaviorPaths];
+        await service.appendMessage({
+          sessionId: state.sessionId,
+          role: "system",
+          content: createModificationPolicyMessage(
+            [
+              "当前任务属于行为性修改，但最新补丁还没有命中真实行为路径。",
+              superficialPaths.length > 0
+                ? `目前检测到的改动仍偏表层：${superficialPaths.join("、")}（只改了 import/comment/轻量整理）。`
+                : "目前检测到的改动仍偏表层，没有看到真实函数体/条件分支/异常映射上的改动。",
+              "下一轮必须继续 modify，在函数体、条件分支、异常映射、返回值或参数处理等真实行为路径上发起 edit/write。",
+            ].join("\n"),
+          ),
+        });
+        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+        continue;
+      }
+
       if (shouldForceVerificationBeforeFinalize) {
         await service.appendMessage({
           sessionId: state.sessionId,
           role: "system",
           content: createVerificationPolicyMessage(
-            "当前 invoke 已经真实修改过文件，但在最新改动之后还没有任何验证尝试。下一轮必须切到 verify phase，并优先通过 bash 运行最小相关验证（测试、typecheck、lint、build 或 git diff --check），不要直接 finalize。",
+            [
+              "当前 invoke 已经真实修改过文件，但在最新改动之后还没有任何验证尝试。下一轮必须切到 verify phase，不要直接 finalize。",
+              formatVerificationRequirement(verificationRequirement),
+            ].join("\n"),
           ),
         });
         runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
@@ -1215,7 +2082,26 @@ export function createAgentLangGraph(
           sessionId: state.sessionId,
           role: "system",
           content: createVerificationPolicyMessage(
-            "最近一次 verify phase 在最新改动之后失败了。下一轮不要 finalize；你必须基于失败输出继续 modify，或者再次请求更小范围的 verify。",
+            [
+              "最近一次 verify phase 在最新改动之后失败了。下一轮不要 finalize；你必须基于失败输出继续 modify，或者再次请求更小范围的 verify。",
+              formatVerificationRequirement(verificationRequirement),
+            ].join("\n"),
+          ),
+        });
+        runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
+        continue;
+      }
+
+      if (shouldForceStrongerVerification) {
+        await service.appendMessage({
+          sessionId: state.sessionId,
+          role: "system",
+          content: createVerificationPolicyMessage(
+            [
+              describeVerificationGap(verificationRequirement, verificationProgress),
+              "不要把这次 verify 当成最终收尾依据；下一轮必须继续补足更强或更贴近修改点的验证。",
+              formatVerificationRequirement(verificationRequirement),
+            ].join("\n"),
           ),
         });
         runtimeState = (await refreshRuntimeState(service, state.sessionId)) ?? runtimeState;
@@ -1326,6 +2212,35 @@ export function createAgentLangGraph(
           }
         }
 
+        if (toolCall.name === "edit" || toolCall.name === "write") {
+          const modificationAnalysis = analyzeWriteLikeModification(toolCall);
+          if (modificationAnalysis) {
+            const modificationBudget = buildModificationBudget(
+              runtimeState,
+              state.userMessage,
+              modificationAnalysis,
+            );
+            const budgetViolation = explainModificationBudgetViolation(
+              modificationBudget,
+              modificationAnalysis,
+            );
+
+            if (budgetViolation) {
+              await service.appendMessage({
+                sessionId: state.sessionId,
+                role: "system",
+                content: createModificationPolicyMessage(
+                  [
+                    "当前 edit 会在高风险共享路径上引入过宽改动，runtime 已在执行前拦截。",
+                    budgetViolation,
+                  ].join("\n"),
+                ),
+              });
+              continue;
+            }
+          }
+        }
+
         const result = await toolExecutor.execute({
           sessionId: state.sessionId,
           name: toolCall.name,
@@ -1347,20 +2262,60 @@ export function createAgentLangGraph(
           lastSuccessfulToolCallKey = toolCallKey;
           if (toolCall.name === "edit" || toolCall.name === "write") {
             executedWriteLikeTool = true;
-            writeGeneration += 1;
+            if (toolPath) {
+              modifiedPathsSinceLatestWrite.add(toolPath);
+            }
+            const modificationAnalysis = analyzeWriteLikeModification(toolCall);
+            if (modificationAnalysis?.substantialCodeChange) {
+              hasSubstantiveBehavioralEdit = true;
+              if (modificationAnalysis.path) {
+                superficialBehaviorPaths.delete(modificationAnalysis.path);
+              }
+            } else if ((modificationAnalysis?.documentationOnly || modificationAnalysis?.importOnly) && modificationAnalysis.path) {
+              superficialBehaviorPaths.add(modificationAnalysis.path);
+            }
+            if (modificationAnalysis?.highRisk && modificationAnalysis.path) {
+              highRiskModifiedPaths.add(modificationAnalysis.path);
+            }
+            verificationProgress = {
+              attempted: false,
+              latestAttemptFailed: false,
+              strongestSuccessfulLevel: "none",
+              hasTargetedBehavioralSuccess: false,
+              hasAdjacentRegressionSuccess: false,
+            };
           }
 
           if (toolCall.name === "grep") {
             recordAnchorLinesFromGrepOutput(viewReadBudgets, result.output);
           }
 
-          if (toolCall.name === "bash" && commandLooksLikeVerification(readBashCommand(toolCall.input))) {
-            verificationAttemptGeneration = Math.max(verificationAttemptGeneration, writeGeneration);
-            const exitCode = readBashExitCode(result.output);
-            if ((exitCode ?? 1) === 0) {
-              verificationSuccessGeneration = Math.max(verificationSuccessGeneration, writeGeneration);
-            } else {
-              verificationFailureGeneration = Math.max(verificationFailureGeneration, writeGeneration);
+          if (toolCall.name === "bash") {
+            const verificationAnalysis = analyzeVerificationCommand(readBashCommand(toolCall.input));
+            if (verificationAnalysis) {
+              const exitCode = readBashExitCode(result.output);
+              if ((exitCode ?? 1) === 0) {
+                verificationProgress = {
+                  attempted: true,
+                  latestAttemptFailed: false,
+                  strongestSuccessfulLevel: pickStrongerVerificationLevel(
+                    verificationProgress.strongestSuccessfulLevel,
+                    verificationAnalysis.level,
+                  ),
+                  hasTargetedBehavioralSuccess:
+                    verificationProgress.hasTargetedBehavioralSuccess
+                    || (verificationAnalysis.level === "behavioral" && verificationAnalysis.targeted),
+                  hasAdjacentRegressionSuccess:
+                    verificationProgress.hasAdjacentRegressionSuccess
+                    || (verificationAnalysis.level === "behavioral" && verificationAnalysis.adjacentRegression),
+                };
+              } else {
+                verificationProgress = {
+                  ...verificationProgress,
+                  attempted: true,
+                  latestAttemptFailed: true,
+                };
+              }
             }
           }
 

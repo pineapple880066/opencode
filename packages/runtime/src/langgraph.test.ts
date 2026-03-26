@@ -1,6 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -1974,16 +1974,38 @@ describe("AgentLangGraphRuntime", () => {
     }
   });
 
-  test("行为性修改在真实 edit 后，没有 verify 不会直接 finalize；verify 失败后也不会直接收尾", async () => {
+  test("行为性修改在有明确测试目标时，必须补齐目标化行为验证后才能 finalize", async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-verify-policy-"));
 
     try {
       const targetPath = path.join(tempRoot, "app.py");
+      const testsDir = path.join(tempRoot, "tests");
       await writeFile(
         targetPath,
         [
           "def greet():",
           "    return \"hello\"",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await mkdir(testsDir, { recursive: true });
+      await writeFile(path.join(testsDir, "__init__.py"), "", "utf8");
+      await writeFile(
+        path.join(testsDir, "test_app.py"),
+        [
+          "import unittest",
+          "",
+          "import app",
+          "",
+          "",
+          "class GreetTests(unittest.TestCase):",
+          "    def test_greet(self):",
+          "        self.assertEqual(app.greet(), \"hello!\")",
+          "",
+          "",
+          "if __name__ == \"__main__\":",
+          "    unittest.main()",
           "",
         ].join("\n"),
         "utf8",
@@ -2034,15 +2056,15 @@ describe("AgentLangGraphRuntime", () => {
           (prefix) => `${prefix}_${++sequence}`,
         ),
         toolApprovalDecider: ({ toolCall }) => toolCall.name === "bash",
-        maxToolRounds: 8,
+        maxToolRounds: 12,
         hooks: {
           goalFactory: async () => ({
-            title: "修复 greet 的返回值并验证没有回归",
-            description: "修改 app.py 的行为后，需要至少做一次最小验证；如果验证失败，不能直接收尾。",
-            successCriteria: ["真实修改文件", "修改后做最小验证", "验证失败时继续修复或重试"],
+            title: "修复 greet 的返回值并保住相关测试",
+            description: "修改 app.py 的行为后，既要做结构性验证，也要围绕 tests/test_app.py 做目标化行为验证。",
+            successCriteria: ["真实修改文件", "结构性验证通过", "相关测试通过后再收尾"],
           }),
           planner: async () => ({
-            summary: "先读取 app.py，再修改，再验证，最后收尾。",
+            summary: "先读取 app.py 和对应测试，再修改，再验证，最后收尾。",
             status: "ready",
             steps: [
               {
@@ -2052,6 +2074,12 @@ describe("AgentLangGraphRuntime", () => {
                 status: "in_progress",
               },
               {
+                id: "plan_step_target",
+                title: "读取测试目标",
+                description: "确认最小行为验证应该落在 tests/test_app.py。",
+                status: "todo",
+              },
+              {
                 id: "plan_step_edit",
                 title: "修改 greet 行为",
                 description: "先故意制造一次需要验证才能发现的问题，再修正它。",
@@ -2059,8 +2087,8 @@ describe("AgentLangGraphRuntime", () => {
               },
               {
                 id: "plan_step_verify",
-                title: "跑最小验证",
-                description: "用 py_compile 验证语法和局部正确性。",
+                title: "跑结构性验证和目标化行为验证",
+                description: "先用 py_compile 兜语法，再用 unittest 跑 tests.test_app。",
                 status: "todo",
               },
             ],
@@ -2070,7 +2098,8 @@ describe("AgentLangGraphRuntime", () => {
             executorCallCount += 1;
             const toolMessages = state.messages.filter((message) => message.role === "tool");
             const systemMessages = state.messages.filter((message) => message.role === "system");
-            const sawView = toolMessages.some((message) => message.content.includes("tool=view"));
+            const sawView = toolMessages.some((message) => message.content.includes("path=app.py"));
+            const sawTestView = toolMessages.some((message) => message.content.includes("path=tests/test_app.py"));
             const editMessages = toolMessages.filter((message) => message.content.includes("tool=edit"));
             const bashMessages = toolMessages.filter((message) => message.content.includes("tool=bash"));
             const sawNeedVerifyNudge = systemMessages.some(
@@ -2078,13 +2107,29 @@ describe("AgentLangGraphRuntime", () => {
                 message.content.includes("VERIFICATION_POLICY: 当前 invoke 已经进入真实修改阶段。")
                 && message.content.includes("还没有任何验证尝试"),
             );
+            const sawNeedStrongerVerify = systemMessages.some(
+              (message) => message.content.includes("缺少一次目标化行为验证"),
+            );
             const sawFailedVerifyNudge = systemMessages.some(
               (message) =>
                 message.content.includes("VERIFICATION_POLICY: 当前 invoke 已经进入真实修改阶段。")
                 && message.content.includes("最近一次 verify phase 在最新改动之后失败了"),
             );
-            const sawFailedVerify = bashMessages.some((message) => message.content.includes("\"exitCode\":1"));
-            const sawSuccessfulVerify = bashMessages.some((message) => message.content.includes("\"exitCode\":0"));
+            const sawFailedVerify = bashMessages.some(
+              (message) =>
+                message.content.includes("python3 -m py_compile app.py")
+                && message.content.includes("\"exitCode\":1"),
+            );
+            const sawSuccessfulStructuralVerify = bashMessages.some(
+              (message) =>
+                message.content.includes("python3 -m py_compile app.py")
+                && message.content.includes("\"exitCode\":0"),
+            );
+            const sawSuccessfulBehaviorVerify = bashMessages.some(
+              (message) =>
+                message.content.includes("python3 -m unittest tests.test_app")
+                && message.content.includes("\"exitCode\":0"),
+            );
 
             if (!sawView) {
               return {
@@ -2096,6 +2141,22 @@ describe("AgentLangGraphRuntime", () => {
                     reasoning: "先看当前 greet 实现。",
                     input: {
                       path: "app.py",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawTestView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_target",
+                    reasoning: "先看测试目标，确定后续 verify 的最小粒度。",
+                    input: {
+                      path: "tests/test_app.py",
                     },
                   },
                 ],
@@ -2170,7 +2231,7 @@ describe("AgentLangGraphRuntime", () => {
               };
             }
 
-            if (!sawSuccessfulVerify) {
+            if (!sawSuccessfulStructuralVerify) {
               return {
                 executionPhase: "verify",
                 toolCalls: [
@@ -2187,22 +2248,46 @@ describe("AgentLangGraphRuntime", () => {
               };
             }
 
+            if (!sawNeedStrongerVerify) {
+              return {
+                executionPhase: "finalize",
+                assistantMessage: "py_compile 已经过了，我先收尾。",
+              };
+            }
+
+            if (!sawSuccessfulBehaviorVerify) {
+              return {
+                executionPhase: "verify",
+                toolCalls: [
+                  {
+                    name: "bash",
+                    taskId: "plan_step_verify",
+                    reasoning: "当前已经拿到明确测试目标，所以继续补足目标化行为验证。",
+                    input: {
+                      command: "python3 -m unittest tests.test_app",
+                      cwd: ".",
+                    },
+                  },
+                ],
+              };
+            }
+
             return {
               executionPhase: "finalize",
-              assistantMessage: "已经修改 greet，并完成最小验证。",
+              assistantMessage: "已经修改 greet，并补齐结构性验证和目标化行为验证。",
               tasks: [
                 {
                   id: "plan_step_edit",
                   title: "修改 greet 行为",
-                  inputSummary: "先故意制造一次需要验证才能发现的问题，再修正它。",
-                  outputSummary: "最终修改已经稳定落地。",
+                  inputSummary: "先故意制造一次需要验证才能发现的问题，再修正它，并跑到目标测试。",
+                  outputSummary: "最终修改已经稳定落地，相关测试也已通过。",
                   status: "done",
                 },
                 {
                   id: "plan_step_verify",
-                  title: "跑最小验证",
-                  inputSummary: "用 py_compile 验证语法和局部正确性。",
-                  outputSummary: "先失败一次，修复后再次通过。",
+                  title: "跑结构性验证和目标化行为验证",
+                  inputSummary: "先用 py_compile 兜语法，再用 unittest 跑 tests.test_app。",
+                  outputSummary: "py_compile 先失败后通过，随后 tests.test_app 也通过。",
                   status: "done",
                 },
               ],
@@ -2210,27 +2295,27 @@ describe("AgentLangGraphRuntime", () => {
           },
           reviewer: async () => ({
             satisfied: true,
-            reasons: ["runtime 在 edit 后追了 verify，并在失败验证后继续推进了修复。"],
+            reasons: ["runtime 没有允许结构性验证替代目标化行为验证。"],
             remainingRisks: [],
           }),
           summarizer: async () => ({
-            shortSummary: "行为性修改必须经过 verify phase 才能稳定收尾",
+            shortSummary: "行为性修改在有明确测试目标时，必须补齐目标化行为验证",
             openLoops: [],
             nextActions: [],
-            importantFacts: ["失败验证后不能直接 finalize"],
+            importantFacts: ["结构性验证不足以替代目标化行为验证"],
           }),
         },
       });
 
       await runtime.invoke({
         sessionId: session.id,
-        userMessage: "修复 app.py 里的 greet 返回值，并确认修改后没有语法问题。",
+        userMessage: "修复 app.py 里的 greet 返回值，并确认 tests/test_app.py 这条相关测试通过。",
       });
 
       const finalContent = await readFile(targetPath, "utf8");
       assert.match(finalContent, /def greet\(\):/);
       assert.match(finalContent, /return "hello!"/);
-      assert.equal(executorCallCount, 8);
+      assert.equal(executorCallCount, 11);
 
       const messages = await store.messages.listBySession(session.id);
       assert.equal(
@@ -2251,16 +2336,1029 @@ describe("AgentLangGraphRuntime", () => {
         true,
       );
       assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("缺少一次目标化行为验证"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && (
+              message.content.includes("优先目标：tests/test_app.py")
+              || message.content.includes("目标验证命令：python3 -m pytest tests/test_app.py")
+              || message.content.includes("目标验证命令：python3 -m unittest tests.test_app")
+              || message.content.includes("tests.test_app")
+            ),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.filter(
+          (message) => message.role === "tool" && message.content.includes("tool=bash"),
+        ).length,
+        3,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "assistant"
+            && message.content.includes("已经修改 greet，并补齐结构性验证和目标化行为验证"),
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("行为性任务里，只有 import/comment 级补丁时不能 finalize，必须继续命中真实行为路径", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-substantive-behavior-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "streaming.py");
+      const testsDir = path.join(tempRoot, "tests");
+      await writeFile(
+        targetPath,
+        [
+          "import socket",
+          "",
+          "def read_chunks(raw):",
+          "    return list(raw.stream(1))",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await mkdir(testsDir, { recursive: true });
+      await writeFile(path.join(testsDir, "__init__.py"), "", "utf8");
+      await writeFile(
+        path.join(testsDir, "test_streaming.py"),
+        [
+          "import socket",
+          "import unittest",
+          "",
+          "import streaming",
+          "",
+          "",
+          "class RawMock:",
+          "    def stream(self, chunk_size):",
+          "        raise socket.error()",
+          "",
+          "",
+          "class StreamTests(unittest.TestCase):",
+          "    def test_wraps_socket_error(self):",
+          "        with self.assertRaises(RuntimeError):",
+          "            streaming.read_chunks(RawMock())",
+          "",
+          "",
+          "if __name__ == \"__main__\":",
+          "    unittest.main()",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-26T12:00:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_substantive_behavior",
+        path: tempRoot,
+        label: "substantive-behavior",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_substantive_behavior",
+        workspaceId: workspace.id,
+        title: "substantive behavior session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        toolApprovalDecider: ({ toolCall }) => toolCall.name === "bash",
+        maxToolRounds: 12,
+        hooks: {
+          goalFactory: async () => ({
+            title: "把 socket.error 包装成 RuntimeError",
+            description: "先解释 streaming.py 的测试，再修复真实行为；只有 import/comment 级补丁不能算完成。",
+            successCriteria: ["真实命中行为路径", "相关测试通过后再收尾"],
+          }),
+          planner: async () => ({
+            summary: "先读源码和测试，再尝试修改；如果只是表层 patch，则继续 modify，直到命中真实行为路径。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_view_source",
+                title: "读取 streaming.py",
+                description: "确认当前行为路径。",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_view_test",
+                title: "读取测试文件",
+                description: "确认目标测试要求。",
+                status: "todo",
+              },
+              {
+                id: "plan_step_modify",
+                title: "修复 socket.error 包装",
+                description: "必须命中真实行为路径。",
+                status: "todo",
+              },
+              {
+                id: "plan_step_verify",
+                title: "运行目标测试",
+                description: "确认 test_streaming 通过。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const toolMessages = state.messages.filter((message) => message.role === "tool");
+            const systemMessages = state.messages.filter((message) => message.role === "system");
+            const sawSourceView = toolMessages.some((message) => message.content.includes("path=streaming.py"));
+            const sawTestView = toolMessages.some((message) => message.content.includes("path=tests/test_streaming.py"));
+            const editMessages = toolMessages.filter((message) => message.content.includes("tool=edit"));
+            const sawSubstantiveNudge = systemMessages.some(
+              (message) =>
+                message.content.includes("MODIFICATION_POLICY: 当前 invoke 已经进入行为修改阶段。")
+                && message.content.includes("真实行为路径"),
+            );
+            const sawBehaviorVerify = toolMessages.some(
+              (message) =>
+                message.content.includes("tool=bash")
+                && message.content.includes("python3 -m unittest tests.test_streaming")
+                && message.content.includes("\"exitCode\":0"),
+            );
+
+            if (!sawSourceView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view_source",
+                    reasoning: "先看当前行为实现。",
+                    input: {
+                      path: "streaming.py",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawTestView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view_test",
+                    reasoning: "确认目标测试要求。",
+                    input: {
+                      path: "tests/test_streaming.py",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (editMessages.length === 0) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_modify",
+                    reasoning: "先做一次表层 patch，验证 runtime 会继续追真实行为修改。",
+                    input: {
+                      path: "streaming.py",
+                      search: "import socket",
+                      replace: "import socket\nfrom typing import Any",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawSubstantiveNudge) {
+              return {
+                executionPhase: "finalize",
+                assistantMessage: "已经加了需要的 import，我先收尾。",
+              };
+            }
+
+            if (editMessages.length === 1) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_modify",
+                    reasoning: "继续命中真实行为路径，把 socket.error 包成 RuntimeError。",
+                    input: {
+                      path: "streaming.py",
+                      search: "def read_chunks(raw):\n    return list(raw.stream(1))",
+                      replace: [
+                        "def read_chunks(raw):",
+                        "    try:",
+                        "        return list(raw.stream(1))",
+                        "    except socket.error as error:",
+                        "        raise RuntimeError(\"socket failed\") from error",
+                      ].join("\n"),
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawBehaviorVerify) {
+              return {
+                executionPhase: "verify",
+                toolCalls: [
+                  {
+                    name: "bash",
+                    taskId: "plan_step_verify",
+                    reasoning: "运行目标测试，确认行为修复已经生效。",
+                    input: {
+                      command: "python3 -m unittest tests.test_streaming",
+                      cwd: ".",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已经命中真实行为路径并通过目标测试。",
+              tasks: [
+                {
+                  id: "plan_step_modify",
+                  title: "修复 socket.error 包装",
+                  inputSummary: "必须命中真实行为路径。",
+                  outputSummary: "最终在函数体里把 socket.error 包成 RuntimeError。",
+                  status: "done",
+                },
+                {
+                  id: "plan_step_verify",
+                  title: "运行目标测试",
+                  inputSummary: "确认 test_streaming 通过。",
+                  outputSummary: "tests.test_streaming 已通过。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["runtime 没有允许 import/comment 级补丁冒充行为修复完成。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "行为任务必须命中真实行为路径，import/comment 级补丁不能 finalize",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["behavioral fix 不能只停在 import/comment 级修改"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage: "解释 tests/test_streaming.py 在测什么，然后修复 streaming.py，让 socket.error 被包装成 RuntimeError。",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /raise RuntimeError\("socket failed"\) from error/);
+      assert.ok(executorCallCount >= 6);
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("MODIFICATION_POLICY: 当前 invoke 已经进入行为修改阶段。")
+            && message.content.includes("只改了 import/comment/轻量整理"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.filter(
+          (message) => message.role === "tool" && message.content.includes("tool=bash"),
+        ).length,
+        1,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "assistant"
+            && message.content.includes("已经命中真实行为路径并通过目标测试"),
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("高风险共享路径上的过宽 edit 会先被 budget guard 拦下，并要求补相邻回归验证后才能 finalize", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-adjacent-regression-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "adapters.py");
+      const testsDir = path.join(tempRoot, "tests");
+      await writeFile(
+        targetPath,
+        [
+          "def normalize_timeout(value):",
+          "    if value is None:",
+          "        return None",
+          "    if value < 0:",
+          "        raise ValueError(\"timeout must be >= 0\")",
+          "    return value",
+          "",
+          "def normalize_retries(value):",
+          "    if value < 0:",
+          "        raise ValueError(\"retries must be >= 0\")",
+          "    return value",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await mkdir(testsDir, { recursive: true });
+      await writeFile(path.join(testsDir, "__init__.py"), "", "utf8");
+      await writeFile(
+        path.join(testsDir, "test_adapters.py"),
+        [
+          "import unittest",
+          "",
+          "import adapters",
+          "",
+          "",
+          "class AdapterBehaviorTests(unittest.TestCase):",
+          "    def test_none_timeout(self):",
+          "        self.assertEqual(adapters.normalize_timeout(None), 30)",
+          "",
+          "    def test_negative_timeout(self):",
+          "        with self.assertRaises(ValueError):",
+          "            adapters.normalize_timeout(-1)",
+          "",
+          "    def test_negative_retries(self):",
+          "        with self.assertRaises(ValueError):",
+          "            adapters.normalize_retries(-1)",
+          "",
+          "",
+          "if __name__ == \"__main__\":",
+          "    unittest.main()",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-26T12:20:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_adjacent_regression",
+        path: tempRoot,
+        label: "adjacent-regression",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_adjacent_regression",
+        workspaceId: workspace.id,
+        title: "adjacent regression session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        toolApprovalDecider: ({ toolCall }) => toolCall.name === "bash",
+        maxToolRounds: 12,
+        hooks: {
+          goalFactory: async () => ({
+            title: "修复 adapters.py 的 timeout 默认值并守住相邻回归",
+            description: "这是共享热路径上的行为修改。除了主目标测试，还要补同模块相邻回归。",
+            successCriteria: ["真实修改文件", "先跑主目标测试", "再补相邻回归后收尾"],
+          }),
+          planner: async () => ({
+            summary: "先读源码和测试，再修改 adapters.py，然后先跑主目标、再跑同模块回归。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_view_source",
+                title: "读取 adapters.py",
+                description: "确认 timeout 逻辑。",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_view_test",
+                title: "读取测试文件",
+                description: "确认主目标和相邻回归。",
+                status: "todo",
+              },
+              {
+                id: "plan_step_modify",
+                title: "修改 timeout 逻辑",
+                description: "落一版真实 patch。",
+                status: "todo",
+              },
+              {
+                id: "plan_step_verify",
+                title: "先主目标、再相邻回归",
+                description: "主目标通过后，还要跑整模块回归。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const toolMessages = state.messages.filter((message) => message.role === "tool");
+            const systemMessages = state.messages.filter((message) => message.role === "system");
+            const sawSourceView = toolMessages.some((message) => message.content.includes("path=adapters.py"));
+            const sawTestView = toolMessages.some((message) => message.content.includes("path=tests/test_adapters.py"));
+            const editMessages = toolMessages.filter((message) => message.content.includes("tool=edit"));
+            const sawBudgetGuard = systemMessages.some(
+              (message) =>
+                message.content.includes("MODIFICATION_POLICY: 当前 invoke 已经进入行为修改阶段。")
+                && message.content.includes("执行前拦截")
+                && message.content.includes("过宽改动"),
+            );
+            const sawNeedVerify = systemMessages.some(
+              (message) =>
+                message.content.includes("VERIFICATION_POLICY: 当前 invoke 已经进入真实修改阶段。")
+                && message.content.includes("还没有任何验证尝试"),
+            );
+            const sawAdjacentRegressionNudge = systemMessages.some(
+              (message) =>
+                message.content.includes("缺少一次相邻回归验证")
+                && message.content.includes("目标验证命令：python3 -m unittest tests.test_adapters.AdapterBehaviorTests.test_none_timeout")
+                && message.content.includes("相邻回归命令：python3 -m unittest tests.test_adapters"),
+            );
+            const sawPrimaryVerify = toolMessages.some(
+              (message) =>
+                message.content.includes("tool=bash")
+                && message.content.includes("python3 -m unittest tests.test_adapters.AdapterBehaviorTests.test_none_timeout")
+                && message.content.includes("\"exitCode\":0"),
+            );
+            const sawAdjacentVerify = toolMessages.some(
+              (message) =>
+                message.content.includes("tool=bash")
+                && message.content.includes("input={\"command\":\"python3 -m unittest tests.test_adapters\",\"cwd\":\".\"}")
+                && message.content.includes("\"exitCode\":0"),
+            );
+
+            if (!sawSourceView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view_source",
+                    reasoning: "先看 adapters.py 的 timeout 逻辑。",
+                    input: {
+                      path: "adapters.py",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawTestView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view_test",
+                    reasoning: "看测试文件，确认主目标和相邻回归。",
+                    input: {
+                      path: "tests/test_adapters.py",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (editMessages.length === 0 && !sawBudgetGuard) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_modify",
+                    reasoning: "先尝试一版过宽 patch，验证 runtime 会拦截高风险共享路径上的超预算 edit。",
+                    input: {
+                      path: "adapters.py",
+                      search: [
+                        "def normalize_timeout(value):",
+                        "    if value is None:",
+                        "        return None",
+                        "    if value < 0:",
+                        "        raise ValueError(\"timeout must be >= 0\")",
+                        "    return value",
+                        "",
+                        "def normalize_retries(value):",
+                        "    if value < 0:",
+                        "        raise ValueError(\"retries must be >= 0\")",
+                        "    return value",
+                      ].join("\n"),
+                      replace: [
+                        "def normalize_timeout(value):",
+                        "    try:",
+                        "        if value is None:",
+                        "            return 30",
+                        "        if value < 0:",
+                        "            raise ValueError(\"timeout must be >= 0\")",
+                        "        return value",
+                        "    except TypeError as error:",
+                        "        raise ValueError(\"timeout must be >= 0\") from error",
+                        "",
+                        "def normalize_retries(value):",
+                        "    try:",
+                        "        if value < 0:",
+                        "            raise ValueError(\"retries must be >= 0\")",
+                        "        return value",
+                        "    except TypeError as error:",
+                        "        raise ValueError(\"retries must be >= 0\") from error",
+                      ].join("\n"),
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (editMessages.length === 0 && sawBudgetGuard) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_modify",
+                    reasoning: "改成最小增量 edit，只命中 timeout 的既有分支。",
+                    input: {
+                      path: "adapters.py",
+                      search: [
+                        "def normalize_timeout(value):",
+                        "    if value is None:",
+                        "        return None",
+                        "    if value < 0:",
+                        "        raise ValueError(\"timeout must be >= 0\")",
+                        "    return value",
+                      ].join("\n"),
+                      replace: [
+                        "def normalize_timeout(value):",
+                        "    if value is None:",
+                        "        return 30",
+                        "    if value < 0:",
+                        "        raise ValueError(\"timeout must be >= 0\")",
+                        "    return value",
+                      ].join("\n"),
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawNeedVerify) {
+              return {
+                executionPhase: "finalize",
+                assistantMessage: "已经改了 adapters.py，我先收尾。",
+              };
+            }
+
+            if (!sawPrimaryVerify) {
+              return {
+                executionPhase: "verify",
+                toolCalls: [
+                  {
+                    name: "bash",
+                    taskId: "plan_step_verify",
+                    reasoning: "先跑主目标测试。",
+                    input: {
+                      command: "python3 -m unittest tests.test_adapters.AdapterBehaviorTests.test_none_timeout",
+                      cwd: ".",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawAdjacentRegressionNudge) {
+              return {
+                executionPhase: "finalize",
+                assistantMessage: "主目标已经过了，我先收尾。",
+              };
+            }
+
+            if (!sawAdjacentVerify) {
+              return {
+                executionPhase: "verify",
+                toolCalls: [
+                  {
+                    name: "bash",
+                    taskId: "plan_step_verify",
+                    reasoning: "补整模块相邻回归，确认没有把旧语义打坏。",
+                    input: {
+                      command: "python3 -m unittest tests.test_adapters",
+                      cwd: ".",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已经通过主目标和相邻回归验证。",
+              tasks: [
+                {
+                  id: "plan_step_modify",
+                  title: "修改 timeout 逻辑",
+                  inputSummary: "落一版真实 patch。",
+                  outputSummary: "共享热路径上的 timeout 逻辑已修改。",
+                  status: "done",
+                },
+                {
+                  id: "plan_step_verify",
+                  title: "先主目标、再相邻回归",
+                  inputSummary: "主目标通过后，还要跑整模块回归。",
+                  outputSummary: "单目标和整模块验证均已通过。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["高风险共享路径上的补丁在 finalize 前补齐了相邻回归验证。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "高风险共享路径会被要求补齐相邻回归验证",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["high-risk shared path 不能只跑单目标测试就收尾"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage:
+          "修复 adapters.py 的 timeout 默认值，并确认 tests.test_adapters.AdapterBehaviorTests.test_none_timeout 通过；这是共享热路径，最后还要补 tests.test_adapters 的相邻回归验证再收尾。",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /return 30/);
+      assert.ok(executorCallCount >= 8);
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("执行前拦截")
+            && message.content.includes("过宽改动"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("缺少一次相邻回归验证")
+            && message.content.includes("目标验证命令：python3 -m unittest tests.test_adapters.AdapterBehaviorTests.test_none_timeout")
+            && message.content.includes("相邻回归命令：python3 -m unittest tests.test_adapters"),
+        ),
+        true,
+      );
+      assert.equal(
         messages.filter(
           (message) => message.role === "tool" && message.content.includes("tool=bash"),
         ).length,
         2,
       );
       assert.equal(
+        messages.filter(
+          (message) => message.role === "tool" && message.content.includes("tool=edit"),
+        ).length,
+        1,
+      );
+      assert.equal(
         messages.some(
           (message) =>
             message.role === "assistant"
-            && message.content.includes("已经修改 greet，并完成最小验证"),
+            && message.content.includes("已经通过主目标和相邻回归验证"),
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("纯结构性修改在真实 edit 后，做过最小结构性验证就可以 finalize", async () => {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-ide-structural-verify-"));
+
+    try {
+      const targetPath = path.join(tempRoot, "util.py");
+      await writeFile(
+        targetPath,
+        [
+          "import os",
+          "import sys",
+          "",
+          "def join_with_prefix(value: str):",
+          "    return os.path.join(sys.prefix, value)",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const store = new InMemoryRuntimeStore();
+      const now = "2026-03-26T10:10:00.000Z";
+      const workspace: Workspace = {
+        id: "workspace_structural_verify",
+        path: tempRoot,
+        label: "structural-verify",
+        createdAt: now,
+        updatedAt: now,
+      };
+      const session: Session = {
+        id: "session_structural_verify",
+        workspaceId: workspace.id,
+        title: "structural verify session",
+        status: "active",
+        activeAgentMode: "build",
+        summary: {
+          shortSummary: "",
+          openLoops: [],
+          nextActions: [],
+          importantFacts: [],
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      store.workspacesMap.set(workspace.id, workspace);
+      store.sessionsMap.set(session.id, session);
+
+      let sequence = 0;
+      let executorCallCount = 0;
+      const service = new GoalDrivenRuntimeService(store, {
+        now: () => now,
+        createId: (prefix: string) => `${prefix}_${++sequence}`,
+      });
+      const runtime = createAgentLangGraph(service, {
+        checkpointer: new PersistentLangGraphCheckpointSaver(
+          new InMemoryLangGraphCheckpointRepository(),
+        ),
+        toolExecutor: new RuntimeToolExecutor(
+          store,
+          createBuiltinToolRegistry(),
+          () => now,
+          (prefix) => `${prefix}_${++sequence}`,
+        ),
+        toolApprovalDecider: ({ toolCall }) => toolCall.name === "bash",
+        hooks: {
+          goalFactory: async () => ({
+            title: "重排 util.py import 顺序",
+            description: "这次只做结构性整理，不改变函数行为。",
+            successCriteria: ["真实修改文件", "至少完成一轮结构性验证"],
+          }),
+          planner: async () => ({
+            summary: "先读取 util.py，再重排 import，并做最小结构性验证。",
+            status: "ready",
+            steps: [
+              {
+                id: "plan_step_view",
+                title: "读取 util.py",
+                description: "确认 import 位置。",
+                status: "in_progress",
+              },
+              {
+                id: "plan_step_edit",
+                title: "重排 import",
+                description: "只做结构性整理。",
+                status: "todo",
+              },
+              {
+                id: "plan_step_verify",
+                title: "做结构性验证",
+                description: "跑最小语法检查。",
+                status: "todo",
+              },
+            ],
+          }),
+          delegate: async () => null,
+          executor: async (state) => {
+            executorCallCount += 1;
+            const sawView = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("path=util.py"),
+            );
+            const sawEdit = state.messages.some(
+              (message) => message.role === "tool" && message.content.includes("tool=edit"),
+            );
+            const sawVerificationPolicy = state.messages.some(
+              (message) =>
+                message.role === "system"
+                && message.content.includes("当前验证门槛：结构性验证"),
+            );
+            const sawSuccessfulVerify = state.messages.some(
+              (message) =>
+                message.role === "tool"
+                && message.content.includes("tool=bash")
+                && message.content.includes("python3 -m py_compile util.py")
+                && message.content.includes("\"exitCode\":0"),
+            );
+
+            if (!sawView) {
+              return {
+                executionPhase: "explain",
+                toolCalls: [
+                  {
+                    name: "view",
+                    taskId: "plan_step_view",
+                    reasoning: "先看 util.py 的 import 区域。",
+                    input: {
+                      path: "util.py",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawEdit) {
+              return {
+                executionPhase: "modify",
+                toolCalls: [
+                  {
+                    name: "edit",
+                    taskId: "plan_step_edit",
+                    reasoning: "只重排 import，不改逻辑。",
+                    input: {
+                      path: "util.py",
+                      search: "import os\nimport sys",
+                      replace: "import sys\nimport os",
+                    },
+                  },
+                ],
+              };
+            }
+
+            if (!sawVerificationPolicy) {
+              return {
+                executionPhase: "finalize",
+                assistantMessage: "这次只是结构整理，我先试着收尾。",
+              };
+            }
+
+            if (!sawSuccessfulVerify) {
+              return {
+                executionPhase: "verify",
+                toolCalls: [
+                  {
+                    name: "bash",
+                    taskId: "plan_step_verify",
+                    reasoning: "跑最小结构性验证。",
+                    input: {
+                      command: "python3 -m py_compile util.py",
+                      cwd: ".",
+                    },
+                  },
+                ],
+              };
+            }
+
+            return {
+              executionPhase: "finalize",
+              assistantMessage: "已完成结构性整理，并通过最小结构性验证。",
+              tasks: [
+                {
+                  id: "plan_step_edit",
+                  title: "重排 import",
+                  inputSummary: "只做结构性整理。",
+                  outputSummary: "import 顺序已调整。",
+                  status: "done",
+                },
+                {
+                  id: "plan_step_verify",
+                  title: "做结构性验证",
+                  inputSummary: "运行 py_compile。",
+                  outputSummary: "结构性验证已通过。",
+                  status: "done",
+                },
+              ],
+            };
+          },
+          reviewer: async () => ({
+            satisfied: true,
+            reasons: ["结构性修改只要求最小结构性验证即可收尾。"],
+            remainingRisks: [],
+          }),
+          summarizer: async () => ({
+            shortSummary: "结构性修改通过最小验证后即可收尾",
+            openLoops: [],
+            nextActions: [],
+            importantFacts: ["结构性验证不强求行为级测试"],
+          }),
+        },
+      });
+
+      await runtime.invoke({
+        sessionId: session.id,
+        userMessage: "重排 util.py 的 import 顺序，不改逻辑，做最小结构性验证后收尾。",
+      });
+
+      const finalContent = await readFile(targetPath, "utf8");
+      assert.match(finalContent, /import sys\nimport os/);
+      assert.equal(executorCallCount, 5);
+
+      const messages = await store.messages.listBySession(session.id);
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "system"
+            && message.content.includes("当前验证门槛：结构性验证"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "tool"
+            && message.content.includes("tool=bash")
+            && message.content.includes("python3 -m py_compile util.py")
+            && message.content.includes("\"exitCode\":0"),
+        ),
+        true,
+      );
+      assert.equal(
+        messages.some(
+          (message) =>
+            message.role === "assistant"
+            && message.content.includes("已完成结构性整理，并通过最小结构性验证"),
         ),
         true,
       );

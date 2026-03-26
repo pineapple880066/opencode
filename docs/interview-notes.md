@@ -342,6 +342,14 @@
 
 这轮我又把“修改后怎么验证”也收进了同一个 control loop，而不是继续堆 benchmark prompt。现在 execute 不只是控制 `read -> modify`，还会控制 `modify -> verify -> finalize`：如果本轮已经真实 `edit/write`，但还没有任何验证尝试，runtime 会追加一条 `VERIFICATION_POLICY` system message，强制下一轮切到 `verify` phase，优先用 `bash` 跑最小相关验证；如果最新一次 verify 明确失败，也不会允许模型直接 finalize，而是必须继续 modify 或再次 verify。这样可以把“改完就收尾”和“测试挂了也硬说完成”这两类问题都压在执行层里，而不是留给模型自觉。
 
+我后来又把这层从“要不要验证”推进到了“验证类型和粒度怎么放行”。现在 runtime 不只判断有没有 verify，还会判断当前 verify 属于：
+
+- 结构性验证
+- 行为验证
+- 目标化行为验证
+
+如果上下文已经出现了明确测试目标，比如用户点名某个测试文件、最近 tool trace 里已经 view 过相关测试文件，或者当前任务本身就是修某条回归，那么只跑 `py_compile / typecheck / lint / git diff --check` 这种结构性验证已经不够了；runtime 会继续阻止 finalize，要求补一轮更贴近修改点的目标化行为验证。反过来，如果任务明确声明“这次不改逻辑，只做结构性整理”，runtime 会接受最小结构性验证，不会强逼跑行为级测试。
+
 这层我会直接点名成：
 
 - `tool-use control loop`
@@ -377,6 +385,17 @@
 - verify bash 识别：`packages/runtime/src/langgraph.ts:751-763`
 - post-write verification gate：`packages/runtime/src/langgraph.ts:1201-1223`
 - 纯注释修改免 verify 回归：`packages/runtime/src/langgraph.test.ts`
+
+如果面试官继续追问“你后面怎么把这层做得更像工程系统，而不是 prompt tricks”，我会再补一句：
+
+“我后来又往前推进了一步：不是只看‘有没有 verify’，而是看‘verify 的类型和粒度够不够’。比如行为性修改如果已经有明确测试目标，只跑 `py_compile` 这种结构性检查仍然不能 finalize；runtime 会继续要求目标化行为验证。相反，纯结构性整理只要完成一轮最小结构性验证就可以收尾。这说明验证门槛已经从单一布尔值，变成了 runtime 里的分级 policy。” 
+
+代码证据：
+
+- verification requirement 构建：`packages/runtime/src/langgraph.ts`
+- verification command 分级：`packages/runtime/src/langgraph.ts`
+- 目标化行为验证回归：`packages/runtime/src/langgraph.test.ts`
+- 结构性验证回归：`packages/runtime/src/langgraph.test.ts`
 
 ### 10. 你怎么解决“重复 view 同一个文件，却迟迟进不了 edit”的问题？
 
@@ -782,6 +801,73 @@
 更细一点可以继续补：
 
 “对我来说，这个 `3/5` 不是为了好看，而是一个很明确的阶段信号：第一，patch 产出链已经稳定；第二，Flask 这条线的问题已经被关掉；第三，后续优化应该集中打 `requests-2148` 的最后一个目标测试，以及 `requests-2674` 的回归副作用，而不是继续泛化地改 UI 或重新折腾 benchmark 基础设施。”
+
+### 15. 你后来怎么把 `requests-2148 / requests-2674` 这两类 benchmark failure class，下沉成 agent 本体能力，而不是继续堆 benchmark prompt？
+
+你可以这样答：
+
+“这一步我刻意没有继续往 benchmark prompt 里塞题目专用提示，因为那样只能提局部分数，不能证明 agent 本体变强。我先把两条实例拆成两类 failure class：`2148` 是修复不完整，agent 找到了方向，但只做了 import/comment 级表层 patch 就想 finalize；`2674` 是高风险共享路径上的修改过重，主目标测试可能过了，但把一组 `PASS_TO_PASS` 回归打坏了。基于这个拆分，我把修复下沉到了 runtime 的 execute control loop 和 verification policy，而不是只改 benchmark runner。” 
+
+具体代码证据：
+
+- verification requirement 分级：
+  - `packages/runtime/src/langgraph.ts:882-1019`
+  - 这里的 `buildVerificationRequirement()` 不再只回答“要不要验证”，而是显式区分：
+    - 结构性验证
+    - 目标化行为验证
+    - 目标化行为验证 + 相邻回归验证
+- verification 命令粒度判断：
+  - `packages/runtime/src/langgraph.ts:1021-1188`
+  - 这里的 `commandLooksLikeAdjacentRegression()`、`analyzeVerificationCommand()`、`describeVerificationGap()` 会把 bash 命令分成：
+    - 结构性检查
+    - 行为验证
+    - 是否已经覆盖相邻回归
+- execute control loop 的真实 gate：
+  - `packages/runtime/src/langgraph.ts:1691-1858`
+  - 这里的 `shouldForceSubstantiveBehaviorEdit`
+  - 以及 `shouldForceVerificationBeforeFinalize / shouldForceStrongerVerification`
+  - 决定了什么时候必须继续 modify、什么时候必须继续 verify、什么时候还不能 finalize
+- edit/write 补丁质量分析：
+  - `packages/runtime/src/langgraph.ts:784-839`
+  - `packages/runtime/src/langgraph.ts:1984-2038`
+  - 这里会把补丁区分成：
+    - import/comment 级表层 patch
+    - 实质性行为修改
+    - 高风险共享路径修改
+- provider 侧执行约束同步：
+  - `apps/ide-web/src/minimax.ts:1271-1279`
+  - 这里明确告诉 executor：
+    - 行为修复不能只停在 import/comment
+    - 高风险共享路径优先最小增量 edit
+    - 高风险共享路径必须补相邻回归
+- 回归测试：
+  - `packages/runtime/src/langgraph.test.ts`
+  - 两条新增场景：
+    - 行为任务里，只有 import/comment 级补丁时不能 finalize
+    - 高风险共享路径上的行为修改，必须补相邻回归验证后才能 finalize
+
+可以继续补这句：
+
+“这一步对我来说最重要的不是加了更多提示词，而是把 agent 的收尾标准从‘模型说它做完了’推进成了‘runtime 代码只允许在满足这些门槛时收尾’。这才是 agent 本体能力的提升。”
+
+如果面试官继续追问“这两个 failure class 分别是怎么映射进 runtime 的”，可以这样答：
+
+- `2148` 型：要求 runtime 识别“表层 patch 不能冒充行为修复”
+  - 如果最新 patch 只改了 import/comment，`executeNode` 会先发 `MODIFICATION_POLICY`，强制继续 modify
+  - 这一步现在优先级高于 verify gate，避免半成品 patch 先被推去验证
+- `2674` 型：要求 runtime 识别“高风险共享路径不能只跑主目标测试”
+  - 如果修改命中了共享热路径，而且上下文里已经有明确测试目标，verification requirement 会升级成“目标化行为验证 + 相邻回归验证”
+  - 这时单个 case 跑绿还不够，runtime 仍然会继续发 `VERIFICATION_POLICY`，逼下一轮补整文件/整模块级验证
+
+验证证据：
+
+- `pnpm typecheck`
+- `pnpm test -- --runInBand`
+- 当前全量 `72` 个测试全绿
+
+这类回答的重点不是“我又调了一版 prompt”，而是：
+
+“我先从 benchmark 结果里抽 failure class，再把修复做进 tool contract、execute control loop 和 verification policy。这样同类问题以后不只在 benchmark 上有效，在普通 agent 编码任务里也会受益。”
 
 ## 当前已经实现到哪
 
@@ -1485,6 +1571,90 @@
 你可以说：
 
 “我没有在 UI 这层一上来就塞进很多框架，而是先补了最小 shell，把 sessions、replay、delegation、inspector 的状态和点击切换走通。这样我先证明这些面板之间的关系是对的，再决定后面要不要接完整浏览器前端。这种推进方式会更稳，也更符合我这个项目先做边界、再做壳子的思路。”
+
+### 亮点 13：我把 benchmark runner 从“跑一下试试”做成了可诊断的执行器
+
+你可以说：
+
+“我后来发现 headless benchmark runner 里最麻烦的问题不是单纯失败，而是卡住的时候完全不知道停在哪。最开始 runner 只有 batch 结束才写 report，所以一旦 `LangGraph invoke` 卡住，外部只看到进程一直不退出。后来我专门给 runner 补了 instance timeout、阶段日志和增量落盘。现在每条实例都会记录 `prepare-workspace`、`runtime-bootstrap`、`create-session`、`invoke`、`collect-artifacts`、`runtime-dispose` 这些阶段，并且中途就持续写 `run-report.json`。这样我在重跑 `requests-2148/2674` 时，能明确看到 `2148` 已经跑完并产出 patch，而 `2674` 是稳定卡在 `invoke:start` 之后超时。这种可诊断性对 benchmark 调优很关键。” 
+
+代码证据：
+
+- `packages/evals/src/swebench-lite.ts`
+  - `readSweBenchLiteInvocation()`：解析 `instanceTimeoutMs`
+  - `withTimeout()`：实例级超时包装
+  - `persistSweBenchArtifacts()`：增量落盘
+  - `runSweBenchLite()`：按实例记录 `stageLogs`
+- `packages/evals/src/swebench-lite.test.ts`
+  - CLI timeout 参数回归测试
+- 真实运行证据：
+  - `.benchmarks/swebench-lite/runs/swebench-lite-requests-rerun-20260326T154500Z/run-report.json`
+
+### 亮点 14：我把 `requests-2674` 的 benchmark 卡死问题，拆成了三个执行层根因，而不是继续怪模型
+
+你可以说：
+
+“`requests-2674` 一开始表现成 benchmark invoke 阶段卡住，但我没有继续调 prompt，而是先把 runner 做成有阶段日志和增量落盘的可诊断工具。拿到账本后我发现它不是单一问题，而是三层执行层阻抗叠在一起：第一，模型第一次真正 edit 时，用的是 `search_replace / new_content`，而我们的 edit 工具当时不兼容；第二，模型会用 `view(root, offset, limit)` 看工作区，但我们把目录当文件读，直接 `EISDIR`；第三，benchmark runner 允许 delegate，可 headless 路径并没有 child execution backend，于是 parent session 会创建 queued 的 subagent run，却没人真的执行 child session。我后来把这三处都修掉：edit 合同补 benchmark 别名、目录 view 降级成目录预览、benchmark runner 显式禁用 delegation。修完后 `2674` 不再 timeout，而且能稳定产出 patch；再送进官方 harness，它已经从‘跑不出来’推进到了‘FAIL_TO_PASS 全过，只剩 4 条 PASS_TO_PASS 回归’。” 
+
+代码证据：
+
+- `packages/tools/src/builtin.ts`
+  - `normalizeEditInput()`：兼容 `search_replace / new_content`
+  - `viewTool()`：目录路径退化成目录预览
+- `packages/runtime/src/langgraph.ts`
+  - `readWriteLikeChangeSegments()`：write-like 分析同步兼容 benchmark 风格字段
+- `packages/evals/src/swebench-lite.ts`
+  - benchmark runner 创建 hooks 时显式禁用 `delegate`
+- `packages/runtime/src/tooling.test.ts`
+  - `search_replace/new_content` 兼容测试
+  - 目录 `view` 退化测试
+- 运行证据：
+  - `.benchmarks/swebench-lite/runs/swebench-lite-requests-2674-rerun-20260326T163200Z/run-report.json`
+  - `.benchmarks/official/SWE-bench/minimax:MiniMax-M2.7.opencode-2674-rerun-20260326T163200Z.json`
+
+### 亮点 15：我没有把高风险共享路径的 patch 质量继续留给 prompt，而是把“最小改动预算”做进了 runtime
+
+你可以说：
+
+“我后来发现 `requests-2674` 这类题真正危险的地方，不是修不到，而是模型很容易在 `adapters.py` 这种共享热路径上直接复制大段流程、包一层宽泛 `try/except`，结果目标测试虽然能过一部分，但 `PASS_TO_PASS` 会炸一片。这个问题如果继续只靠 prompt 提醒，效果不稳定，所以我把它下沉到了 runtime：在 `toolExecutor.execute(...)` 之前先分析这次 `edit/write` 的改动规模、有效代码行数和是否像宽范围控制流重写；如果超出预算，就直接拦截，不让这版 patch 先落盘。” 
+
+代码证据：
+
+- `packages/runtime/src/langgraph.ts`
+  - `analyzeWriteLikeModification()`：抽取路径、有效代码行数、是否属于宽范围重写
+  - `buildModificationBudget()`：只对高风险共享路径上的行为修复开启预算
+  - `explainModificationBudgetViolation()`：把超预算原因写成系统级 `MODIFICATION_POLICY`
+  - `executeNode` 的工具循环：在 `toolExecutor.execute(...)` 前执行 budget guard
+- `packages/runtime/src/langgraph.test.ts`
+  - `高风险共享路径上的过宽 edit 会先被 budget guard 拦下，并要求补相邻回归验证后才能 finalize`
+
+这件事面试里最值得讲的点是：
+
+- 我没有继续把“patch 太大”当成模型能力问题
+- 我把它转成了 runtime 可以强制执行的工程约束
+- 这样 agent 至少不会在高风险共享路径上轻易落下一版明显过宽的补丁
+
+### 亮点 16：我把“相邻回归验证”从一句模糊提示，推进成了显式命令选择器
+
+你可以说：
+
+“之前 verification policy 已经知道高风险共享路径不能只跑目标测试，但它给 executor 的还是文件名级提示。后来我继续往前推进了一步：runtime 会从上下文里抽 pytest/unittest 风格的测试选择器，再把它收成两组显式命令，一组是最小目标验证命令，另一组是相邻回归命令。这样系统提示给模型的，不再只是‘去补同模块回归’，而是会直接出现像 `python3 -m unittest tests.test_adapters.AdapterBehaviorTests.test_none_timeout` 和 `python3 -m unittest tests.test_adapters` 这样的建议命令。” 
+
+代码证据：
+
+- `packages/runtime/src/langgraph.ts`
+  - `extractTestSelectorHintsFromText()`：从上下文里抽测试选择器
+  - `buildTargetedBehavioralCommands()`：生成目标验证命令
+  - `buildAdjacentRegressionCommands()`：生成相邻回归命令
+  - `formatVerificationRequirement()`：把命令写进 `VERIFICATION_POLICY` 提示
+- `packages/runtime/src/langgraph.test.ts`
+  - `高风险共享路径上的过宽 edit 会先被 budget guard 拦下，并要求补相邻回归验证后才能 finalize`
+  - `行为性修改在有明确测试目标时，必须补齐目标化行为验证后才能 finalize`
+
+这件事面试里可以强调两个 trade-off：
+
+- 我没有直接在 runtime 里替模型执行这些命令，而是先把它做成显式建议，这样保留了 provider 层的灵活性
+- 但我也不再满足于“只写文件名提示”，因为那样对 verify phase 的约束仍然太弱
 
 ## 讲项目时的推荐顺序
 

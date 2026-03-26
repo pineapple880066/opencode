@@ -18,6 +18,7 @@ const execFileAsync = promisify(execFile);
 
 export const SWEBENCH_LITE_DEFAULT_INSTANCES_FILE = ".benchmarks/swebench-lite/instances.json";
 export const SWEBENCH_LITE_DEFAULT_CACHE_ROOT = ".benchmarks/swebench-lite/cache";
+export const SWEBENCH_LITE_DEFAULT_INSTANCE_TIMEOUT_MS = 8 * 60 * 1000;
 
 export interface SweBenchLiteInstance {
   instance_id: string;
@@ -36,19 +37,26 @@ export interface SweBenchPrediction {
   model_patch: string;
 }
 
+export interface SweBenchLiteStageLog {
+  stage: string;
+  at: string;
+  detail?: string;
+}
+
 export interface SweBenchLiteInstanceRunReport {
   instanceId: string;
   repo: string;
   baseCommit: string;
   workspacePath: string;
   sessionId?: string;
-  status: "completed" | "failed";
+  status: "running" | "completed" | "failed" | "timed_out";
   patchBytes: number;
   changedFiles: string[];
   toolInvocationCount: number;
   lastAssistantMessage?: string;
   executionLog: string[];
   durationMs: number;
+  stageLogs: SweBenchLiteStageLog[];
   error?: string;
 }
 
@@ -57,6 +65,7 @@ export interface SweBenchLiteRunReport {
   startedAt: string;
   finishedAt?: string;
   modelName: string;
+  instanceTimeoutMs: number;
   instancesFile: string;
   predictionsPath: string;
   workspaceRoot: string;
@@ -66,6 +75,7 @@ export interface SweBenchLiteRunReport {
     total: number;
     completed: number;
     failed: number;
+    timedOut: number;
     withPatch: number;
   };
   instances: SweBenchLiteInstanceRunReport[];
@@ -81,6 +91,7 @@ export interface SweBenchLiteInvocation {
   limit?: number;
   continueOnError: boolean;
   modelName?: string;
+  instanceTimeoutMs: number;
 }
 
 interface CommandOptions {
@@ -92,6 +103,16 @@ interface CommandOptions {
 interface LangGraphInvocationResult {
   runtimeState?: AgentGraphState | null;
   executionLog?: string[];
+}
+
+class InstanceTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(message: string, timeoutMs: number) {
+    super(message);
+    this.name = "InstanceTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
 }
 
 function pad(value: number): string {
@@ -113,6 +134,19 @@ function normalizeInstanceIdList(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
+function parsePositiveInteger(value: string | undefined, fallback: number): number {
+  if (!value || value.trim().length === 0) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`数值参数必须是正整数，当前收到: ${value}`);
+  }
+
+  return parsed;
+}
+
 export function readSweBenchLiteInvocation(
   argv: string[] = process.argv.slice(2),
   env: NodeJS.ProcessEnv = process.env,
@@ -120,7 +154,7 @@ export function readSweBenchLiteInvocation(
   // benchmark runner 的 CLI 只保留最关键的目录和筛选参数，
   // 这样一次批处理跑完之后，输出物位置和复现实例范围都是稳定可追的。
   const args = [...argv];
-  const runId = env.SWEBENCH_RUN_ID?.trim() || createDefaultSweBenchRunId();
+  let runId = env.SWEBENCH_RUN_ID?.trim() || createDefaultSweBenchRunId();
   let instancesFile =
     env.SWEBENCH_INSTANCES_FILE?.trim() || path.resolve(process.cwd(), SWEBENCH_LITE_DEFAULT_INSTANCES_FILE);
   let outputDir =
@@ -134,10 +168,18 @@ export function readSweBenchLiteInvocation(
     env.SWEBENCH_LIMIT && env.SWEBENCH_LIMIT.trim().length > 0 ? Number(env.SWEBENCH_LIMIT) : undefined;
   let continueOnError = env.SWEBENCH_FAIL_FAST === "1" ? false : true;
   let modelName = env.SWEBENCH_MODEL_NAME?.trim() || undefined;
+  let instanceTimeoutMs = parsePositiveInteger(
+    env.SWEBENCH_INSTANCE_TIMEOUT_MS,
+    SWEBENCH_LITE_DEFAULT_INSTANCE_TIMEOUT_MS,
+  );
 
   while (args.length > 0) {
     const current = args.shift();
     if (!current) {
+      continue;
+    }
+
+    if (current === "--") {
       continue;
     }
 
@@ -165,6 +207,7 @@ export function readSweBenchLiteInvocation(
     if (current === "--run-id") {
       const next = args.shift()?.trim();
       if (next) {
+        runId = next;
         outputDir = path.resolve(process.cwd(), ".benchmarks/swebench-lite/runs", next);
         workspaceRoot = path.resolve(outputDir, "workspaces");
       }
@@ -199,6 +242,11 @@ export function readSweBenchLiteInvocation(
       modelName = args.shift()?.trim() || modelName;
       continue;
     }
+
+    if (current === "--instance-timeout-ms") {
+      instanceTimeoutMs = parsePositiveInteger(args.shift(), instanceTimeoutMs);
+      continue;
+    }
   }
 
   if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
@@ -215,6 +263,7 @@ export function readSweBenchLiteInvocation(
     limit,
     continueOnError,
     modelName,
+    instanceTimeoutMs,
   };
 }
 
@@ -516,12 +565,14 @@ export function buildSweBenchTaskPrompt(instance: SweBenchLiteInstance): string 
 function buildRunSummary(report: SweBenchLiteRunReport): SweBenchLiteRunReport["summary"] {
   const completed = report.instances.filter((item) => item.status === "completed").length;
   const failed = report.instances.filter((item) => item.status === "failed").length;
+  const timedOut = report.instances.filter((item) => item.status === "timed_out").length;
   const withPatch = report.instances.filter((item) => item.patchBytes > 0).length;
 
   return {
     total: report.instances.length,
     completed,
     failed,
+    timedOut,
     withPatch,
   };
 }
@@ -544,6 +595,56 @@ async function safeCollectDebugState(runtime: Awaited<ReturnType<typeof createId
     messages,
     toolInvocations,
   };
+}
+
+async function withTimeout<T>(
+  task: Promise<T>,
+  timeoutMs: number,
+  messageFactory: () => string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+
+  try {
+    return await Promise.race([
+      task,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new InstanceTimeoutError(messageFactory(), timeoutMs));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function persistSweBenchArtifacts(
+  report: SweBenchLiteRunReport,
+  predictions: SweBenchPrediction[],
+  predictionsPath: string,
+  reportPath: string,
+  selectedInstanceIdsPath: string,
+): Promise<void> {
+  report.summary = buildRunSummary(report);
+
+  await Promise.all([
+    writeFile(predictionsPath, JSON.stringify(predictions, null, 2), "utf8"),
+    writeFile(reportPath, JSON.stringify(report, null, 2), "utf8"),
+    writeFile(selectedInstanceIdsPath, `${report.selectedInstanceIds.join("\n")}\n`, "utf8"),
+  ]);
+}
+
+function upsertPrediction(predictions: SweBenchPrediction[], nextPrediction: SweBenchPrediction): void {
+  const currentIndex = predictions.findIndex((prediction) => prediction.instance_id === nextPrediction.instance_id);
+
+  if (currentIndex >= 0) {
+    predictions[currentIndex] = nextPrediction;
+    return;
+  }
+
+  predictions.push(nextPrediction);
 }
 
 export async function runSweBenchLite(
@@ -578,6 +679,7 @@ export async function runSweBenchLite(
     runId: invocation.runId,
     startedAt: new Date().toISOString(),
     modelName,
+    instanceTimeoutMs: invocation.instanceTimeoutMs,
     instancesFile: invocation.instancesFile,
     predictionsPath,
     workspaceRoot: invocation.workspaceRoot,
@@ -587,116 +689,207 @@ export async function runSweBenchLite(
       total: 0,
       completed: 0,
       failed: 0,
+      timedOut: 0,
       withPatch: 0,
     },
     instances: [],
   };
   const predictions: SweBenchPrediction[] = [];
 
-  const runtime = await createIdeRuntimeEnvironment({
-    hooks: createMiniMaxHooks({ env }),
-    // runner 是 headless 的，没有交互式批准按钮。
-    // benchmark 若完全禁用 bash，很多实例连最小验证命令都跑不了。
-    // 所以这里只在 benchmark 路径里对 bash 单独自动批准。
-    toolApprovalDecider: ({ toolCall }) => toolCall.name === "bash",
-    // benchmark 任务通常需要比 IDE 交互更长的工具链：
-    // 先 grep/list 定位，再多次精读，再 edit / bash。
-    // 保持网页默认 5 轮，但在 headless benchmark 路径里放宽到 8 轮，
-    // 避免像 flask-4045 这种“刚定位到正确锚点就到轮数上限”的情况。
-    maxToolRounds: 8,
-  });
+  const hooks = {
+    ...createMiniMaxHooks({ env }),
+    // 当前 benchmark runner 是 headless 单 session patch 生成器，
+    // 并没有真正的 child-session execution backend。
+    // 如果允许 delegate，父 session 只会创建 queued 的 subagent run，
+    // 然后继续往下执行，最后出现“summary 以为子代理做了事，但工作区没有 patch”的假推进。
+    // 所以 benchmark 路径里显式禁用 delegation，强制把修复留在当前 session 内完成。
+    delegate: undefined,
+  };
+  await persistSweBenchArtifacts(report, predictions, predictionsPath, reportPath, selectedInstanceIdsPath);
 
-  try {
-    for (const instance of instances) {
-      const startedAt = Date.now();
-      const workspacePath = await prepareInstanceWorkspace(instance, invocation.workspaceRoot, invocation.cacheRoot);
-      const session = await runtime.service.createSession({
-        workspacePath,
-        title: `SWE-bench Lite ${instance.instance_id}`,
-        agentMode: "build",
+  for (const instance of instances) {
+    const startedAt = Date.now();
+    const workspacePath = path.join(invocation.workspaceRoot, instance.instance_id);
+    const instanceReport: SweBenchLiteInstanceRunReport = {
+      instanceId: instance.instance_id,
+      repo: instance.repo,
+      baseCommit: instance.base_commit,
+      workspacePath,
+      status: "running",
+      patchBytes: 0,
+      changedFiles: [],
+      toolInvocationCount: 0,
+      executionLog: [],
+      durationMs: 0,
+      stageLogs: [],
+    };
+    report.instances.push(instanceReport);
+    await persistSweBenchArtifacts(report, predictions, predictionsPath, reportPath, selectedInstanceIdsPath);
+
+    let currentStage = "queued";
+    let runtime: Awaited<ReturnType<typeof createIdeRuntimeEnvironment>> | undefined;
+    let latestResult: LangGraphInvocationResult | undefined;
+    const recordStage = async (stage: string, detail?: string) => {
+      currentStage = stage;
+      instanceReport.durationMs = Date.now() - startedAt;
+      instanceReport.stageLogs.push({
+        stage,
+        at: new Date().toISOString(),
+        detail,
+      });
+      console.log(
+        `[swebench-lite][${instance.instance_id}] ${stage}${detail ? ` :: ${detail}` : ""}`,
+      );
+      await persistSweBenchArtifacts(report, predictions, predictionsPath, reportPath, selectedInstanceIdsPath);
+    };
+
+    try {
+      await withTimeout(
+        (async () => {
+          await recordStage("prepare-workspace:start");
+          instanceReport.workspacePath = await prepareInstanceWorkspace(
+            instance,
+            invocation.workspaceRoot,
+            invocation.cacheRoot,
+          );
+          await recordStage("prepare-workspace:done", instanceReport.workspacePath);
+
+          await recordStage("runtime-bootstrap:start");
+          runtime = await createIdeRuntimeEnvironment({
+            hooks,
+            // runner 是 headless 的，没有交互式批准按钮。
+            // benchmark 若完全禁用 bash，很多实例连最小验证命令都跑不了。
+            // 所以这里只在 benchmark 路径里对 bash 单独自动批准。
+            toolApprovalDecider: ({ toolCall }) => toolCall.name === "bash",
+            // benchmark 任务通常需要比 IDE 交互更长的工具链：
+            // 先 grep/list 定位，再多次精读，再 edit / bash。
+            // 保持网页默认 5 轮，但在 headless benchmark 路径里放宽到 8 轮，
+            // 避免像 flask-4045 这种“刚定位到正确锚点就到轮数上限”的情况。
+            maxToolRounds: 8,
+          });
+          await recordStage("runtime-bootstrap:done");
+
+          await recordStage("create-session:start");
+          const session = await runtime.service.createSession({
+            workspacePath: instanceReport.workspacePath,
+            title: `SWE-bench Lite ${instance.instance_id}`,
+            agentMode: "build",
+          });
+          instanceReport.sessionId = session.id;
+          await recordStage("create-session:done", session.id);
+
+          await recordStage("invoke:start");
+          latestResult = (await runtime.langGraph.invoke({
+            sessionId: session.id,
+            userMessage: buildSweBenchTaskPrompt(instance),
+          })) as LangGraphInvocationResult;
+          await recordStage(
+            "invoke:done",
+            `${latestResult.executionLog?.length ?? 0} execution log entries`,
+          );
+
+          await recordStage("collect-artifacts:start");
+          const [patch, changedFiles, debugState] = await Promise.all([
+            collectGitDiff(instanceReport.workspacePath),
+            collectChangedFiles(instanceReport.workspacePath),
+            safeCollectDebugState(runtime, session.id),
+          ]);
+          upsertPrediction(predictions, {
+            instance_id: instance.instance_id,
+            model_name_or_path: modelName,
+            model_patch: patch,
+          });
+          instanceReport.status = "completed";
+          instanceReport.patchBytes = Buffer.byteLength(patch, "utf8");
+          instanceReport.changedFiles = changedFiles;
+          instanceReport.toolInvocationCount = debugState.toolInvocations.length;
+          instanceReport.lastAssistantMessage = pickLastAssistantMessage(debugState.messages);
+          instanceReport.executionLog = latestResult.executionLog ?? [];
+          instanceReport.durationMs = Date.now() - startedAt;
+          await recordStage(
+            "collect-artifacts:done",
+            `patch=${instanceReport.patchBytes} bytes files=${changedFiles.length}`,
+          );
+        })(),
+        invocation.instanceTimeoutMs,
+        () =>
+          `实例 ${instance.instance_id} 在阶段 ${currentStage} 超时（>${invocation.instanceTimeoutMs}ms）`,
+      );
+    } catch (error) {
+      const [patch, changedFiles, debugState] =
+        runtime && instanceReport.sessionId
+          ? await Promise.all([
+              withTimeout(
+                collectGitDiff(instanceReport.workspacePath).catch(() => ""),
+                10_000,
+                () => `收集 ${instance.instance_id} 的 git diff 超时`,
+              ).catch(() => ""),
+              withTimeout(
+                collectChangedFiles(instanceReport.workspacePath).catch(() => []),
+                10_000,
+                () => `收集 ${instance.instance_id} 的 changed files 超时`,
+              ).catch(() => []),
+              withTimeout(
+                safeCollectDebugState(runtime, instanceReport.sessionId).catch(() => ({
+                  messages: [],
+                  toolInvocations: [],
+                })),
+                10_000,
+                () => `收集 ${instance.instance_id} 的 debug state 超时`,
+              ).catch(() => ({
+                messages: [],
+                toolInvocations: [],
+              })),
+            ])
+          : ["", [], { messages: [], toolInvocations: [] }];
+
+      upsertPrediction(predictions, {
+        instance_id: instance.instance_id,
+        model_name_or_path: modelName,
+        model_patch: patch,
       });
 
-      try {
-        const result = (await runtime.langGraph.invoke({
-          sessionId: session.id,
-          userMessage: buildSweBenchTaskPrompt(instance),
-        })) as LangGraphInvocationResult;
+      instanceReport.status = error instanceof InstanceTimeoutError ? "timed_out" : "failed";
+      instanceReport.patchBytes = Buffer.byteLength(patch, "utf8");
+      instanceReport.changedFiles = changedFiles;
+      instanceReport.toolInvocationCount = debugState.toolInvocations.length;
+      instanceReport.lastAssistantMessage = pickLastAssistantMessage(debugState.messages);
+      instanceReport.executionLog = latestResult?.executionLog ?? [];
+      instanceReport.durationMs = Date.now() - startedAt;
+      instanceReport.error = error instanceof Error ? error.message : String(error);
+      await recordStage(instanceReport.status === "timed_out" ? "instance:timed-out" : "instance:failed", instanceReport.error);
 
-        const [patch, changedFiles, debugState] = await Promise.all([
-          collectGitDiff(workspacePath),
-          collectChangedFiles(workspacePath),
-          safeCollectDebugState(runtime, session.id),
-        ]);
-
-        predictions.push({
-          instance_id: instance.instance_id,
-          model_name_or_path: modelName,
-          model_patch: patch,
+      if (!invocation.continueOnError) {
+        throw error;
+      }
+    } finally {
+      if (runtime) {
+        await recordStage("runtime-dispose:start");
+        await withTimeout(
+          runtime.dispose(),
+          30_000,
+          () => `释放实例 ${instance.instance_id} 的 runtime 超时`,
+        ).catch(async (disposeError) => {
+          instanceReport.error = [
+            instanceReport.error,
+            disposeError instanceof Error ? disposeError.message : String(disposeError),
+          ]
+            .filter(Boolean)
+            .join("\n");
+          await recordStage("runtime-dispose:failed", instanceReport.error);
         });
-
-        report.instances.push({
-          instanceId: instance.instance_id,
-          repo: instance.repo,
-          baseCommit: instance.base_commit,
-          workspacePath,
-          sessionId: session.id,
-          status: "completed",
-          patchBytes: Buffer.byteLength(patch, "utf8"),
-          changedFiles,
-          toolInvocationCount: debugState.toolInvocations.length,
-          lastAssistantMessage: pickLastAssistantMessage(debugState.messages),
-          executionLog: result.executionLog ?? [],
-          durationMs: Date.now() - startedAt,
-        });
-      } catch (error) {
-        const [patch, changedFiles, debugState] = await Promise.all([
-          collectGitDiff(workspacePath).catch(() => ""),
-          collectChangedFiles(workspacePath).catch(() => []),
-          safeCollectDebugState(runtime, session.id).catch(() => ({
-            messages: [],
-            toolInvocations: [],
-          })),
-        ]);
-
-        predictions.push({
-          instance_id: instance.instance_id,
-          model_name_or_path: modelName,
-          model_patch: patch,
-        });
-
-        report.instances.push({
-          instanceId: instance.instance_id,
-          repo: instance.repo,
-          baseCommit: instance.base_commit,
-          workspacePath,
-          sessionId: session.id,
-          status: "failed",
-          patchBytes: Buffer.byteLength(patch, "utf8"),
-          changedFiles,
-          toolInvocationCount: debugState.toolInvocations.length,
-          lastAssistantMessage: pickLastAssistantMessage(debugState.messages),
-          executionLog: [],
-          durationMs: Date.now() - startedAt,
-          error: error instanceof Error ? error.message : String(error),
-        });
-
-        if (!invocation.continueOnError) {
-          throw error;
+        if (!instanceReport.stageLogs.some((entry) => entry.stage === "runtime-dispose:failed")) {
+          await recordStage("runtime-dispose:done");
         }
       }
+
+      instanceReport.durationMs = Date.now() - startedAt;
+      await persistSweBenchArtifacts(report, predictions, predictionsPath, reportPath, selectedInstanceIdsPath);
     }
-  } finally {
-    await runtime.dispose();
   }
 
   report.finishedAt = new Date().toISOString();
-  report.summary = buildRunSummary(report);
-
-  await Promise.all([
-    writeFile(predictionsPath, JSON.stringify(predictions, null, 2), "utf8"),
-    writeFile(reportPath, JSON.stringify(report, null, 2), "utf8"),
-    writeFile(selectedInstanceIdsPath, `${report.selectedInstanceIds.join("\n")}\n`, "utf8"),
-  ]);
+  await persistSweBenchArtifacts(report, predictions, predictionsPath, reportPath, selectedInstanceIdsPath);
 
   return report;
 }

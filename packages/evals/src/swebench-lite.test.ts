@@ -9,29 +9,42 @@ import {
   createDefaultSweBenchRunId,
   parseSweBenchInstancesContent,
   readSweBenchLiteInvocation,
+  SWEBENCH_LITE_DEFAULT_INSTANCE_TIMEOUT_MS,
 } from "./swebench-lite.js";
 
 describe("SWE-bench Lite runner helpers", () => {
   test("会解析 CLI 参数并生成稳定的默认目录", () => {
     const invocation = readSweBenchLiteInvocation(
       [
+        "--",
+        "--run-id",
+        "swebench-lite-custom",
         "--instances-file",
         "fixtures/instances.json",
         "--instance",
         "sympy__sympy-20590",
         "--limit",
         "5",
+        "--instance-timeout-ms",
+        "90000",
         "--fail-fast",
       ],
       {},
     );
 
+    assert.equal(invocation.runId, "swebench-lite-custom");
     assert.match(invocation.instancesFile, /fixtures\/instances\.json$/);
     assert.equal(invocation.instanceIds[0], "sympy__sympy-20590");
     assert.equal(invocation.limit, 5);
+    assert.equal(invocation.instanceTimeoutMs, 90_000);
     assert.equal(invocation.continueOnError, false);
     assert.match(invocation.outputDir, /\.benchmarks\/swebench-lite\/runs\//);
     assert.match(invocation.workspaceRoot, /\.benchmarks\/swebench-lite\/runs\/.*\/workspaces$/);
+  });
+
+  test("没有显式传参时会回落到默认 instance timeout", () => {
+    const invocation = readSweBenchLiteInvocation([], {});
+    assert.equal(invocation.instanceTimeoutMs, SWEBENCH_LITE_DEFAULT_INSTANCE_TIMEOUT_MS);
   });
 
   test("会解析 JSON 和 JSONL 两种实例文件格式", () => {
